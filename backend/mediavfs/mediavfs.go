@@ -19,8 +19,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/lib/pq"
-
 	"github.com/rclone/rclone/backend/mediavfs/gphoto"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -1070,36 +1068,17 @@ func (f *Fs) changeNotify(ctx context.Context, notify func(string, fs.EntryType)
 		fs.Debugf(f, "mediavfs: Processing %d batched notifications", len(pendingEvents))
 
 		// Collect unique directories to invalidate
+		// Path is now included in notification payload - no DB query needed
 		dirsToInvalidate := make(map[string]bool)
 		hasDelete := false
 
-		// Collect media keys for non-DELETE events
-		var mediaKeys []string
 		for _, event := range pendingEvents {
 			if event.Action == "DELETE" {
 				hasDelete = true
 			} else {
-				mediaKeys = append(mediaKeys, event.MediaKey)
-			}
-		}
-
-		// Batch query all media items at once (fixes N+1 query pattern)
-		if len(mediaKeys) > 0 {
-			query := fmt.Sprintf(`
-				SELECT COALESCE(path, '') as custom_path
-				FROM %s WHERE media_key = ANY($1) AND user_name = $2
-			`, f.opt.TableName)
-
-			rows, err := f.db.QueryContext(ctx, query, pq.Array(mediaKeys), f.opt.User)
-			if err == nil {
-				defer rows.Close()
-				for rows.Next() {
-					var customPath string
-					if err := rows.Scan(&customPath); err == nil {
-						displayPath := strings.Trim(customPath, "/")
-						dirsToInvalidate[displayPath] = true
-					}
-				}
+				// Use path directly from notification payload
+				displayPath := strings.Trim(event.Path, "/")
+				dirsToInvalidate[displayPath] = true
 			}
 		}
 

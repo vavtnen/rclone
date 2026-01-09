@@ -25,6 +25,7 @@ type MediaChangeEvent struct {
 	Action   string `json:"action"`    // INSERT, UPDATE, DELETE
 	UserName string `json:"user_name"` // User who owns the media
 	MediaKey string `json:"media_key"` // Media key affected
+	Path     string `json:"path"`      // File path (for cache invalidation)
 }
 
 // NotifyListener manages PostgreSQL LISTEN/NOTIFY for real-time updates
@@ -181,21 +182,25 @@ DECLARE
     payload JSON;
     affected_user TEXT;
     affected_key TEXT;
+    affected_path TEXT;
 BEGIN
     -- Determine which row to use based on operation
     IF TG_OP = 'DELETE' THEN
         affected_user := OLD.user_name;
         affected_key := OLD.media_key;
+        affected_path := COALESCE(OLD.path, '');
     ELSE
         affected_user := NEW.user_name;
         affected_key := NEW.media_key;
+        affected_path := COALESCE(NEW.path, '');
     END IF;
 
-    -- Build JSON payload
+    -- Build JSON payload (includes path for direct cache invalidation)
     payload := json_build_object(
         'action', TG_OP,
         'user_name', affected_user,
-        'media_key', affected_key
+        'media_key', affected_key,
+        'path', affected_path
     );
 
     -- Send notification
