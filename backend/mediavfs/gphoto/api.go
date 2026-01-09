@@ -1,4 +1,5 @@
-package mediavfs
+// Package gphoto provides Google Photos internal API client for the mediavfs backend.
+package gphoto
 
 import (
 	"bytes"
@@ -31,22 +32,22 @@ const (
 	maxRetries     = 10
 )
 
-// GPhotoAPI handles Google Photos API interactions
-type GPhotoAPI struct {
+// API handles Google Photos API interactions
+type API struct {
 	token          string
 	tokenExpiry    int64 // Token expiry in milliseconds
 	tokenMu        sync.Mutex // Protects token access to prevent race conditions
 	httpClient     *http.Client
 	tokenServerURL string
-	nativeAuth     *GooglePhotosAuth // Native auth client (optional)
+	nativeAuth     *Auth // Native auth client (optional)
 	userAgent      string
 	user           string
 	timeout        time.Duration
 }
 
-// NewGPhotoAPI creates a new Google Photos API client
-func NewGPhotoAPI(user string, tokenServerURL string, httpClient *http.Client) *GPhotoAPI {
-	return &GPhotoAPI{
+// NewAPI creates a new Google Photos API client
+func NewAPI(user string, tokenServerURL string, httpClient *http.Client) *API {
+	return &API{
 		user:           user,
 		tokenServerURL: tokenServerURL,
 		httpClient:     httpClient,
@@ -55,9 +56,9 @@ func NewGPhotoAPI(user string, tokenServerURL string, httpClient *http.Client) *
 	}
 }
 
-// NewGPhotoAPIWithNativeAuth creates a new Google Photos API client with native authentication
-func NewGPhotoAPIWithNativeAuth(user, tokenServerURL, masterToken, privateKeyS, androidID string, httpClient *http.Client) (*GPhotoAPI, error) {
-	api := &GPhotoAPI{
+// NewAPIWithNativeAuth creates a new Google Photos API client with native authentication
+func NewAPIWithNativeAuth(user, tokenServerURL, masterToken, privateKeyS, androidID string, httpClient *http.Client) (*API, error) {
+	api := &API{
 		user:           user,
 		tokenServerURL: tokenServerURL,
 		httpClient:     httpClient,
@@ -71,7 +72,7 @@ func NewGPhotoAPIWithNativeAuth(user, tokenServerURL, masterToken, privateKeyS, 
 		if !strings.Contains(email, "@") {
 			email = user + "@gmail.com"
 		}
-		nativeAuth, err := NewGooglePhotosAuth(email, masterToken, androidID, privateKeyS, httpClient)
+		nativeAuth, err := NewAuth(email, masterToken, androidID, privateKeyS, httpClient)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create native auth: %w", err)
 		}
@@ -83,7 +84,7 @@ func NewGPhotoAPIWithNativeAuth(user, tokenServerURL, masterToken, privateKeyS, 
 }
 
 // GetAuthToken fetches or refreshes the authentication token
-func (api *GPhotoAPI) GetAuthToken(ctx context.Context, force bool) error {
+func (api *API) GetAuthToken(ctx context.Context, force bool) error {
 	// Use native auth if available
 	if api.nativeAuth != nil {
 		return api.getNativeAuthToken(ctx, force)
@@ -94,7 +95,7 @@ func (api *GPhotoAPI) GetAuthToken(ctx context.Context, force bool) error {
 }
 
 // getNativeAuthToken gets token using native authentication
-func (api *GPhotoAPI) getNativeAuthToken(ctx context.Context, force bool) error {
+func (api *API) getNativeAuthToken(ctx context.Context, force bool) error {
 	api.tokenMu.Lock()
 	defer api.tokenMu.Unlock()
 
@@ -126,7 +127,7 @@ func (api *GPhotoAPI) getNativeAuthToken(ctx context.Context, force bool) error 
 }
 
 // getTokenServerToken gets token from external token server
-func (api *GPhotoAPI) getTokenServerToken(ctx context.Context, force bool) error {
+func (api *API) getTokenServerToken(ctx context.Context, force bool) error {
 	if api.tokenServerURL == "" {
 		return fmt.Errorf("no token server URL configured and no native auth available")
 	}
@@ -164,7 +165,7 @@ func (api *GPhotoAPI) getTokenServerToken(ctx context.Context, force bool) error
 }
 
 // request makes an authenticated HTTP request with retry logic
-func (api *GPhotoAPI) request(ctx context.Context, method, url string, headers map[string]string, body io.Reader) (*http.Response, error) {
+func (api *API) request(ctx context.Context, method, url string, headers map[string]string, body io.Reader) (*http.Response, error) {
 	var resp *http.Response
 	var err error
 	var bodyBytes []byte
@@ -315,7 +316,7 @@ func readResponseBody(resp *http.Response) ([]byte, error) {
 }
 
 // GetUploadToken obtains an upload token from Google Photos
-func (api *GPhotoAPI) GetUploadToken(ctx context.Context, sha1HashB64 string, fileSize int64) (string, error) {
+func (api *API) GetUploadToken(ctx context.Context, sha1HashB64 string, fileSize int64) (string, error) {
 	// Encode protobuf message matching Python implementation
 	encoder := NewProtoEncoder()
 	encoder.EncodeInt32(1, 2)
@@ -349,7 +350,7 @@ func (api *GPhotoAPI) GetUploadToken(ctx context.Context, sha1HashB64 string, fi
 }
 
 // FindRemoteMediaByHash checks if a file with the given SHA1 hash already exists
-func (api *GPhotoAPI) FindRemoteMediaByHash(ctx context.Context, sha1Hash []byte) (string, error) {
+func (api *API) FindRemoteMediaByHash(ctx context.Context, sha1Hash []byte) (string, error) {
 	// Encode nested protobuf message matching Python implementation
 	// Field 1 -> Field 1 -> Field 1: raw SHA1 hash bytes (NOT base64)
 	innermost := NewProtoEncoder()
@@ -403,7 +404,7 @@ func (api *GPhotoAPI) FindRemoteMediaByHash(ctx context.Context, sha1Hash []byte
 }
 
 // UploadFile uploads file content to Google Photos and returns the decoded response
-func (api *GPhotoAPI) UploadFile(ctx context.Context, uploadToken string, content io.Reader, fileSize int64) ([]byte, error) {
+func (api *API) UploadFile(ctx context.Context, uploadToken string, content io.Reader, fileSize int64) ([]byte, error) {
 	url := fmt.Sprintf("https://photos.googleapis.com/data/upload/uploadmedia/interactive?upload_id=%s", uploadToken)
 
 	headers := map[string]string{
@@ -430,7 +431,7 @@ func (api *GPhotoAPI) UploadFile(ctx context.Context, uploadToken string, conten
 }
 
 // CommitUpload commits the uploaded file to Google Photos
-func (api *GPhotoAPI) CommitUpload(ctx context.Context, uploadResponse []byte, fileName string, sha1Hash []byte, fileSize int64, uploadTimestamp int64, model, quality string) (string, error) {
+func (api *API) CommitUpload(ctx context.Context, uploadResponse []byte, fileName string, sha1Hash []byte, fileSize int64, uploadTimestamp int64, model, quality string) (string, error) {
 	qualityMap := map[string]int32{
 		"saver":    1,
 		"original": 3,
@@ -552,7 +553,7 @@ func findMediaKeyInResponse(data interface{}) string {
 }
 
 // MoveToTrash moves files to trash (supports batch deletion)
-func (api *GPhotoAPI) MoveToTrash(ctx context.Context, dedupKeys []string) error {
+func (api *API) MoveToTrash(ctx context.Context, dedupKeys []string) error {
 	fs.Debugf(nil, "gphoto: MoveToTrash processing %d files", len(dedupKeys))
 
 	// Build nested protobuf structure for MoveToTrash
@@ -631,7 +632,7 @@ func (api *GPhotoAPI) MoveToTrash(ctx context.Context, dedupKeys []string) error
 }
 
 // GetLibraryState gets the current library state from Google Photos
-func (api *GPhotoAPI) GetLibraryState(ctx context.Context, stateToken, pageToken string) ([]byte, error) {
+func (api *API) GetLibraryState(ctx context.Context, stateToken, pageToken string) ([]byte, error) {
 	// Build protobuf message using official Google protobuf library
 	protoBody := buildGetLibraryStateMessage(stateToken, pageToken)
 
@@ -670,13 +671,13 @@ func (api *GPhotoAPI) GetLibraryState(ctx context.Context, stateToken, pageToken
 }
 
 // GetLibraryPage gets a page of library results (for incremental sync)
-func (api *GPhotoAPI) GetLibraryPage(ctx context.Context, pageToken, stateToken string) ([]byte, error) {
+func (api *API) GetLibraryPage(ctx context.Context, pageToken, stateToken string) ([]byte, error) {
 	return api.GetLibraryState(ctx, stateToken, pageToken)
 }
 
 // GetLibraryPageInit gets a page of library results during initial sync
 // This uses a different message template that returns batches of items
-func (api *GPhotoAPI) GetLibraryPageInit(ctx context.Context, pageToken string) ([]byte, error) {
+func (api *API) GetLibraryPageInit(ctx context.Context, pageToken string) ([]byte, error) {
 	// Build protobuf message using init template
 	protoBody := buildGetLibraryPageInitMessage(pageToken)
 
@@ -716,7 +717,7 @@ func (api *GPhotoAPI) GetLibraryPageInit(ctx context.Context, pageToken string) 
 
 // GetDownloadURL gets the download URL for a media item
 // Based on Python implementation: api.get_download_url()
-func (api *GPhotoAPI) GetDownloadURL(ctx context.Context, mediaKey string) (string, error) {
+func (api *API) GetDownloadURL(ctx context.Context, mediaKey string) (string, error) {
 	// Build protobuf message matching Python implementation
 	// Field 1 -> Field 1 -> Field 1: media_key
 	field1_1 := NewProtoEncoder()

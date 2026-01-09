@@ -1,4 +1,4 @@
-package mediavfs
+package gphoto
 
 // buildGetLibraryStateMessage creates the message for get_library_state
 // This uses the FULL template from Python to get complete data

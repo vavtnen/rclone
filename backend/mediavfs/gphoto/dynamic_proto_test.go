@@ -1,4 +1,4 @@
-package mediavfs
+package gphoto
 
 import (
 	"testing"

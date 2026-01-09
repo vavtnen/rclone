@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/lib/pq"
+	"github.com/rclone/rclone/backend/mediavfs/gphoto"
 	"github.com/rclone/rclone/fs"
 )
 
@@ -408,7 +409,7 @@ func (f *Fs) UpdateSyncState(ctx context.Context, stateToken, pageToken string, 
 }
 
 // InsertMediaItems inserts or updates media items in the database
-func (f *Fs) InsertMediaItems(ctx context.Context, items []MediaItem) error {
+func (f *Fs) InsertMediaItems(ctx context.Context, items []gphoto.MediaItem) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -530,7 +531,7 @@ func (f *Fs) SyncFromGooglePhotos(ctx context.Context, user string) error {
 // Workflow matches Python's _cache_init:
 // 1. Call get_library_state("") once to establish state_token
 // 2. Use get_library_page_init(page_token) for pagination
-func (f *Fs) initialSync(ctx context.Context, api *GPhotoAPI, user string) error {
+func (f *Fs) initialSync(ctx context.Context, api *gphoto.API, user string) error {
 	// Step 1: Get initial library state (establishes state_token)
 	fs.Debugf(f, "Getting initial library state")
 	response, err := api.GetLibraryState(ctx, "", "")
@@ -584,7 +585,7 @@ func (f *Fs) initialSync(ctx context.Context, api *GPhotoAPI, user string) error
 
 // processInitPages paginates through remaining items during initial sync
 // Matches Python's _process_pages_init
-func (f *Fs) processInitPages(ctx context.Context, api *GPhotoAPI, user string, stateToken string, pageToken string) error {
+func (f *Fs) processInitPages(ctx context.Context, api *gphoto.API, user string, stateToken string, pageToken string) error {
 	for pageToken != "" {
 		fs.Debugf(f, "Fetching next page (pageToken=%q)", pageToken)
 		response, err := api.GetLibraryPageInit(ctx, pageToken)
@@ -627,7 +628,7 @@ func (f *Fs) processInitPages(ctx context.Context, api *GPhotoAPI, user string, 
 }
 
 // incrementalSync performs an incremental sync from Google Photos
-func (f *Fs) incrementalSync(ctx context.Context, api *GPhotoAPI, user string, stateToken string) error {
+func (f *Fs) incrementalSync(ctx context.Context, api *gphoto.API, user string, stateToken string) error {
 	response, err := api.GetLibraryState(ctx, stateToken, "")
 	if err != nil {
 		return fmt.Errorf("failed to get library state: %w", err)
@@ -703,16 +704,16 @@ func (f *Fs) incrementalSync(ctx context.Context, api *GPhotoAPI, user string, s
 }
 
 // parseLibraryResponse parses the Google Photos library response using protobuf decoding
-func parseLibraryResponse(response []byte, user string) (stateToken, pageToken string, items []MediaItem, deletions []string, err error) {
+func parseLibraryResponse(response []byte, user string) (stateToken, pageToken string, items []gphoto.MediaItem, deletions []string, err error) {
 	// Decode protobuf response to map structure
 	// Use DecodeDynamicMessage which keeps bytes as bytes (doesn't recursively decode)
-	data, err := DecodeDynamicMessage(response)
+	data, err := gphoto.DecodeDynamicMessage(response)
 	if err != nil {
 		return "", "", nil, nil, fmt.Errorf("failed to decode protobuf response: %w", err)
 	}
 
 	// Parse using the proper parser
-	newStateToken, newPageToken, mediaItems, mediaKeysToDelete, err := ParseDbUpdate(data)
+	newStateToken, newPageToken, mediaItems, mediaKeysToDelete, err := gphoto.ParseDbUpdate(data)
 	if err != nil {
 		return "", "", nil, nil, fmt.Errorf("failed to parse library update: %w", err)
 	}

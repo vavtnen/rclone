@@ -19,6 +19,7 @@ import (
 	"time"
 
 	_ "github.com/lib/pq" // PostgreSQL driver
+	"github.com/rclone/rclone/backend/mediavfs/gphoto"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
@@ -180,7 +181,7 @@ type Fs struct {
 	db          *sql.DB
 	dbConnStr   string // stored for lazy notify listener start
 	httpClient  *http.Client
-	api         *GPhotoAPI // Google Photos API client for download URLs
+	api         *gphoto.API // Google Photos API client for download URLs
 	urlCache    *urlCache
 	urlFetchGroup singleflight.Group // Coalesces duplicate URL fetch requests
 	// lazyMeta stores metadata loaded asynchronously for large listings
@@ -198,7 +199,7 @@ type Fs struct {
 	// syncStop channel to stop background sync goroutine
 	syncStop chan struct{}
 	// notifyListener for PostgreSQL LISTEN/NOTIFY real-time updates (lazy started)
-	notifyListener *NotifyListener
+	notifyListener *gphoto.NotifyListener
 	notifyOnce     sync.Once
 	// mountReady is closed when the mount is ready (ChangeNotify has been called)
 	// Put operations wait for this before uploading
@@ -365,13 +366,13 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	// Initialize Google Photos API client for download URLs
 	// Use native auth if master_token is provided, otherwise fall back to token server
 	if opt.MasterToken != "" {
-		api, err := NewGPhotoAPIWithNativeAuth(opt.User, opt.TokenServerURL, opt.MasterToken, opt.PrivateKeyS, opt.AndroidID, customClient)
+		api, err := gphoto.NewAPIWithNativeAuth(opt.User, opt.TokenServerURL, opt.MasterToken, opt.PrivateKeyS, opt.AndroidID, customClient)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create API client with native auth: %w", err)
 		}
 		f.api = api
 	} else if opt.TokenServerURL != "" {
-		f.api = NewGPhotoAPI(opt.User, opt.TokenServerURL, customClient)
+		f.api = gphoto.NewAPI(opt.User, opt.TokenServerURL, customClient)
 	} else {
 		return nil, fmt.Errorf("either master_token or token_server_url must be provided")
 	}
@@ -906,7 +907,7 @@ func (f *Fs) ChangeNotify(ctx context.Context, notify func(string, fs.EntryType)
 func (f *Fs) startNotifyListener(ctx context.Context) {
 	f.notifyOnce.Do(func() {
 		fs.Debugf(f, "Starting PostgreSQL notify listener (mount detected)")
-		f.notifyListener = NewNotifyListener(f.dbConnStr, f.opt.User)
+		f.notifyListener = gphoto.NewNotifyListener(f.dbConnStr, f.opt.User)
 		if err := f.notifyListener.Start(ctx); err != nil {
 			fs.Errorf(f, "Failed to start notify listener (falling back to polling): %v", err)
 			f.notifyListener = nil
@@ -945,14 +946,14 @@ func (f *Fs) changeNotify(ctx context.Context, notify func(string, fs.EntryType)
 	}
 
 	// Get notify listener events channel (may be nil if listener failed to start)
-	var notifyEvents <-chan MediaChangeEvent
+	var notifyEvents <-chan gphoto.MediaChangeEvent
 	if f.notifyListener != nil {
 		notifyEvents = f.notifyListener.Events()
 	}
 
 	// Debounce settings for batch processing
 	const debounceDelay = 200 * time.Millisecond
-	var pendingEvents []MediaChangeEvent
+	var pendingEvents []gphoto.MediaChangeEvent
 	var debounceTimer *time.Timer
 	var debounceChan <-chan time.Time
 
@@ -1762,7 +1763,7 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 
 		initialURL, err := o.fs.api.GetDownloadURL(ctx, o.mediaKey)
 		if err != nil {
-			if errors.Is(err, ErrMediaNotFound) {
+			if errors.Is(err, gphoto.ErrMediaNotFound) {
 				fs.Errorf(o, "File not found in Google Photos: %s - removing from database", o.remote)
 				deleteQuery := fmt.Sprintf(`DELETE FROM %s WHERE media_key = $1`, o.fs.opt.TableName)
 				_, delErr := o.fs.db.ExecContext(ctx, deleteQuery, o.mediaKey)
