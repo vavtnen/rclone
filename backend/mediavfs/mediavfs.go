@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -34,7 +36,6 @@ const (
 
 var (
 	errNotWritable = errors.New("mediavfs is read-only - files cannot be created, modified, or deleted from database")
-	errCrossUser   = errors.New("cannot move files between different users")
 )
 
 // urlMetadata stores cached URL resolution and ETag information
@@ -125,8 +126,20 @@ func init() {
 			Advanced: true,
 		}, {
 			Name:     "token_server_url",
-			Help:     "URL of the token server for Google Photos authentication (required).",
-			Required: true,
+			Help:     "URL of the token server for Google Photos authentication.\n\nNot required if master_token is provided.",
+		}, {
+			Name:     "master_token",
+			Help:     "Google account master token (aas_et/...) for native authentication.\n\nThis allows native token generation without a separate token server.",
+			Advanced: true,
+		}, {
+			Name:     "private_key_s",
+			Help:     "Private key scalar (hex) for token binding.\n\nOptional. Only needed if token binding is required.",
+			Advanced: true,
+		}, {
+			Name:     "android_id",
+			Help:     "Android device ID for authentication.\n\nDefaults to a generic ID if not provided.",
+			Default:  "",
+			Advanced: true,
 		}, {
 			Name:     "auto_sync",
 			Help:     "Enable automatic background sync to detect new files uploaded via Google Photos web/app.",
@@ -151,6 +164,9 @@ type Options struct {
 	EnableUpload   bool   `config:"enable_upload"`
 	EnableDelete   bool   `config:"enable_delete"`
 	TokenServerURL string `config:"token_server_url"`
+	MasterToken    string `config:"master_token"`
+	PrivateKeyS    string `config:"private_key_s"`
+	AndroidID      string `config:"android_id"`
 	AutoSync       bool   `config:"auto_sync"`
 	SyncInterval   int    `config:"sync_interval"`
 }
@@ -165,7 +181,8 @@ type Fs struct {
 	dbConnStr   string // stored for lazy notify listener start
 	httpClient  *http.Client
 	api         *GPhotoAPI // Google Photos API client for download URLs
-	urlCache *urlCache
+	urlCache    *urlCache
+	urlFetchGroup singleflight.Group // Coalesces duplicate URL fetch requests
 	// lazyMeta stores metadata loaded asynchronously for large listings
 	lazyMeta map[string]*Object
 	lazyMu   sync.RWMutex
@@ -183,6 +200,10 @@ type Fs struct {
 	// notifyListener for PostgreSQL LISTEN/NOTIFY real-time updates (lazy started)
 	notifyListener *NotifyListener
 	notifyOnce     sync.Once
+	// mountReady is closed when the mount is ready (ChangeNotify has been called)
+	// Put operations wait for this before uploading
+	mountReady     chan struct{}
+	mountReadyOnce sync.Once
 }
 
 // dirCacheEntry represents a cached directory listing
@@ -203,11 +224,19 @@ type Object struct {
 	displayPath string // The path to display (from 'path' column or derived from remote)
 }
 
-// convertUnixTimestamp converts a Unix timestamp (seconds or milliseconds) to time.Time
+// convertUnixTimestamp converts a Unix timestamp (seconds, milliseconds, or microseconds) to time.Time
+// Always returns second precision to match Precision() and avoid modtime comparison issues
 func convertUnixTimestamp(timestamp int64) time.Time {
-	// If timestamp is > 10^10, it's likely in milliseconds
-	if timestamp > 10000000000 {
-		return time.Unix(timestamp/1000, (timestamp%1000)*1000000)
+	// Detect timestamp precision and convert to seconds:
+	// - Microseconds (> 10^15): divide by 1,000,000
+	// - Milliseconds (> 10^12): divide by 1,000
+	// - Seconds (< 10^12): use as-is
+	// Current Unix time is ~1.7 billion (1.7 × 10^9) seconds
+	if timestamp > 1000000000000000 { // > 10^15, likely microseconds
+		return time.Unix(timestamp/1000000, 0)
+	}
+	if timestamp > 1000000000000 { // > 10^12, likely milliseconds
+		return time.Unix(timestamp/1000, 0)
 	}
 	// Otherwise assume seconds
 	return time.Unix(timestamp, 0)
@@ -229,8 +258,10 @@ func (f *Fs) String() string {
 }
 
 // Precision of the ModTimes in this Fs
+// Return 24 hours precision - we truncate ModTime to date only to avoid
+// VFS cache invalidation due to timestamp precision differences
 func (f *Fs) Precision() time.Duration {
-	return time.Second
+	return 24 * time.Hour
 }
 
 // Hashes returns the supported hash types of the filesystem
@@ -298,7 +329,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 				// Preserve Range header (critical for resume/seeking)
 				if rangeHeader := originalReq.Header.Get("Range"); rangeHeader != "" {
 					req.Header.Set("Range", rangeHeader)
-					fs.Infof(nil, "mediavfs: preserving Range header on redirect: %s", rangeHeader)
+					fs.Debugf(nil, "mediavfs: preserving Range header on redirect: %s", rangeHeader)
 				}
 				// Preserve If-Range header (critical for ETag validation)
 				if ifRangeHeader := originalReq.Header.Get("If-Range"); ifRangeHeader != "" {
@@ -308,7 +339,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 				if userAgent := originalReq.Header.Get("User-Agent"); userAgent != "" {
 					req.Header.Set("User-Agent", userAgent)
 				}
-				fs.Infof(nil, "mediavfs: following redirect from %s to %s",
+				fs.Debugf(nil, "mediavfs: following redirect from %s to %s",
 					via[len(via)-1].URL.Redacted(), req.URL.Redacted())
 			}
 			return nil
@@ -328,10 +359,22 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		dirCache:          make(map[string]*dirCacheEntry),
 		folderExistsCache: make(map[string]bool),
 		syncStop:          make(chan struct{}),
+		mountReady:        make(chan struct{}),
 	}
 
 	// Initialize Google Photos API client for download URLs
-	f.api = NewGPhotoAPI(opt.User, opt.TokenServerURL, customClient)
+	// Use native auth if master_token is provided, otherwise fall back to token server
+	if opt.MasterToken != "" {
+		api, err := NewGPhotoAPIWithNativeAuth(opt.User, opt.TokenServerURL, opt.MasterToken, opt.PrivateKeyS, opt.AndroidID, customClient)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create API client with native auth: %w", err)
+		}
+		f.api = api
+	} else if opt.TokenServerURL != "" {
+		f.api = NewGPhotoAPI(opt.User, opt.TokenServerURL, customClient)
+	} else {
+		return nil, fmt.Errorf("either master_token or token_server_url must be provided")
+	}
 
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
@@ -342,7 +385,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.features.ChangeNotify = f.ChangeNotify
 
 	// Initialize database schema
-	fs.Infof(f, "Initializing database schema...")
+	fs.Debugf(f, "Initializing database schema...")
 	if err := f.InitializeDatabase(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to initialize database: %w", err)
@@ -358,7 +401,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	// Perform initial sync if needed
 	if opt.User != "" {
-		fs.Infof(f, "Checking sync state for user: %s", opt.User)
+		fs.Debugf(f, "Checking sync state for user: %s", opt.User)
 		state, err := f.GetSyncState(ctx)
 		if err != nil {
 			fs.Errorf(f, "Failed to get sync state: %v", err)
@@ -374,7 +417,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 				}
 			}()
 		} else {
-			fs.Infof(f, "User %s already synced", opt.User)
+			fs.Debugf(f, "User %s already synced", opt.User)
 			// Start background sync immediately if already synced and auto_sync is enabled
 			if opt.AutoSync {
 				f.startBackgroundSync()
@@ -395,26 +438,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	return f, nil
-}
-
-// splitUserPath splits a path into username and the rest
-// e.g., "john/photos/img.jpg" -> "john", "photos/img.jpg"
-func splitUserPath(remote string) (userName string, filePath string) {
-	parts := strings.SplitN(remote, "/", 2)
-	if len(parts) == 1 {
-		return parts[0], ""
-	}
-	return parts[0], parts[1]
-}
-
-// extractPathAndName extracts path and name from file_name if it contains "/"
-// e.g., "photos/vacation/img.jpg" -> "photos/vacation", "img.jpg"
-func extractPathAndName(fileName string) (path string, name string) {
-	if strings.Contains(fileName, "/") {
-		lastSlash := strings.LastIndex(fileName, "/")
-		return fileName[:lastSlash], fileName[lastSlash+1:]
-	}
-	return "", fileName
 }
 
 // buildConnectionString combines base connection string with database name
@@ -476,6 +499,12 @@ func ensureDatabaseExists(ctx context.Context, baseConn, dbName string) error {
 
 // List the objects and directories in dir into entries
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	// Signal mount is ready when first List is called
+	f.mountReadyOnce.Do(func() {
+		fs.Debugf(f, "Mount ready - List called")
+		close(f.mountReady)
+	})
+
 	// Normalize dir - remove any trailing slashes
 	dir = strings.Trim(dir, "/")
 	root := strings.Trim(path.Join(f.root, dir), "/")
@@ -527,6 +556,7 @@ func (f *Fs) listUserFiles(ctx context.Context, userName string, dirPath string)
 	// Simple query: get all items where path = dirPath
 	// Folders have type = -1, files have type >= 0
 	// Exclude trashed items (trash_timestamp > 0)
+	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
 	// Trim trailing slashes from path for comparison
 	query := fmt.Sprintf(`
 		SELECT
@@ -540,6 +570,7 @@ func (f *Fs) listUserFiles(ctx context.Context, userName string, dirPath string)
 		FROM %s
 		WHERE user_name = $1 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+			AND (is_canonical IS NULL OR is_canonical = true)
 		ORDER BY type ASC, file_name ASC
 	`, f.opt.TableName)
 
@@ -636,88 +667,6 @@ func (f *Fs) listUserFiles(ctx context.Context, userName string, dirPath string)
 	return entries, nil
 }
 
-// populateMetadata loads size/modtime/mediaKey for files in batches
-func (f *Fs) populateMetadata(userName string) {
-	batch := f.opt.BatchSize
-	if batch <= 0 {
-		batch = 1000
-	}
-
-	offset := 0
-	for {
-		query := fmt.Sprintf(`
-			SELECT media_key, file_name, COALESCE(name, '') as custom_name, COALESCE(path, '') as custom_path, COALESCE(size_bytes, 0) as size_bytes, COALESCE(utc_timestamp, 0) as utc_timestamp
-			FROM %s
-			ORDER BY file_name
-			LIMIT $1 OFFSET $2
-		`, f.opt.TableName)
-
-		rows, err := f.db.Query(query, batch, offset)
-		if err != nil {
-			fs.Errorf(f, "mediavfs: populateMetadata query failed: %v", err)
-			return
-		}
-
-		count := 0
-		for rows.Next() {
-			var mediaKey, fileName, customName, customPath string
-			var sizeBytes int64
-			var timestampUnix int64
-			if err := rows.Scan(&mediaKey, &fileName, &customName, &customPath, &sizeBytes, &timestampUnix); err != nil {
-				fs.Errorf(f, "mediavfs: populateMetadata scan failed: %v", err)
-				continue
-			}
-
-			// compute display path/name as in listUserFiles
-			var displayName, displayPath string
-			// Display name: use 'name' if set, else use 'file_name'
-			if customName != "" {
-				displayName = customName
-			} else {
-				displayName = fileName
-			}
-			// Display path: use 'path' if set, else empty
-			if customPath != "" {
-				displayPath = strings.Trim(customPath, "/")
-			} else {
-				displayPath = ""
-			}
-
-			var fullPath string
-			if displayPath != "" {
-				fullPath = displayPath + "/" + displayName
-			} else {
-				fullPath = displayName
-			}
-
-			key := fullPath // No username prefix in single-user model
-			obj := &Object{
-				fs:          f,
-				remote:      key,
-				mediaKey:    mediaKey,
-				size:        sizeBytes,
-				modTime:     convertUnixTimestamp(timestampUnix),
-				userName:    userName,
-				displayName: displayName,
-				displayPath: displayPath,
-			}
-
-			f.lazyMu.Lock()
-			f.lazyMeta[key] = obj
-			f.lazyMu.Unlock()
-
-			count++
-		}
-		rows.Close()
-
-		if count < batch {
-			// finished
-			return
-		}
-		offset += batch
-	}
-}
-
 // NewObject finds the Object at remote
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	// Use configured user for per-user mounts
@@ -781,11 +730,13 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 	// Directory was prefetched but file not found - check if it's a folder
 	// This is a single query for the specific file/folder
+	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
 	folderQuery := fmt.Sprintf(`
 		SELECT type FROM %s
 		WHERE user_name = $1
 			AND TRIM(BOTH '/' FROM COALESCE(path, '')) || '/' || TRIM(BOTH '/' FROM COALESCE(NULLIF(name, ''), file_name)) = $2
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+			AND (is_canonical IS NULL OR is_canonical = true)
 		LIMIT 1
 	`, f.opt.TableName)
 
@@ -803,6 +754,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 
 	// Fallback: file exists but wasn't in cache (shouldn't normally happen)
+	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
 	query := fmt.Sprintf(`
 		SELECT
 			media_key,
@@ -814,6 +766,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		FROM %s
 		WHERE user_name = $1
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+			AND (is_canonical IS NULL OR is_canonical = true)
 			AND TRIM(BOTH '/' FROM COALESCE(path, '')) || '/' || TRIM(BOTH '/' FROM COALESCE(NULLIF(name, ''), file_name)) = $2
 		LIMIT 1
 	`, f.opt.TableName)
@@ -941,13 +894,18 @@ func (f *Fs) addToDirCache(dirPath string, entry fs.DirEntry) {
 // ChangeNotify calls the passed function with a path that has had changes.
 // The implementation must empty the channel and stop when it is closed.
 func (f *Fs) ChangeNotify(ctx context.Context, notify func(string, fs.EntryType), newInterval <-chan time.Duration) {
+	// Signal that mount is ready - this is called by VFS when mount is set up
+	f.mountReadyOnce.Do(func() {
+		fs.Debugf(f, "Mount ready - ChangeNotify called")
+		close(f.mountReady)
+	})
 	go f.changeNotify(ctx, notify, newInterval)
 }
 
 // startNotifyListener lazily starts the PostgreSQL notify listener (only for mount)
 func (f *Fs) startNotifyListener(ctx context.Context) {
 	f.notifyOnce.Do(func() {
-		fs.Infof(f, "Starting PostgreSQL notify listener (mount detected)")
+		fs.Debugf(f, "Starting PostgreSQL notify listener (mount detected)")
 		f.notifyListener = NewNotifyListener(f.dbConnStr, f.opt.User)
 		if err := f.notifyListener.Start(ctx); err != nil {
 			fs.Errorf(f, "Failed to start notify listener (falling back to polling): %v", err)
@@ -973,8 +931,18 @@ func (f *Fs) changeNotify(ctx context.Context, notify func(string, fs.EntryType)
 	if !ok {
 		return
 	}
-	ticker := time.NewTicker(dur)
-	defer ticker.Stop()
+
+	// Create ticker only if interval > 0 (0 means polling disabled)
+	var ticker *time.Ticker
+	var tickerChan <-chan time.Time
+	if dur > 0 {
+		ticker = time.NewTicker(dur)
+		tickerChan = ticker.C
+		defer ticker.Stop()
+		fs.Debugf(f, "mediavfs: ChangeNotify polling enabled with interval %s", dur)
+	} else {
+		fs.Debugf(f, "mediavfs: ChangeNotify polling disabled (interval=0), using DB notify only")
+	}
 
 	// Get notify listener events channel (may be nil if listener failed to start)
 	var notifyEvents <-chan MediaChangeEvent
@@ -1042,12 +1010,28 @@ func (f *Fs) changeNotify(ctx context.Context, notify func(string, fs.EntryType)
 		select {
 		case d, ok := <-newInterval:
 			if !ok {
-				ticker.Stop()
+				if ticker != nil {
+					ticker.Stop()
+				}
 				processPendingEvents() // Process any remaining events
 				return
 			}
-			fs.Infof(f, "mediavfs: ChangeNotify interval updated to %s", d)
-			ticker.Reset(d)
+			fs.Debugf(f, "mediavfs: ChangeNotify interval updated to %s", d)
+			if d > 0 {
+				if ticker == nil {
+					ticker = time.NewTicker(d)
+					tickerChan = ticker.C
+				} else {
+					ticker.Reset(d)
+				}
+			} else {
+				// Disable polling
+				if ticker != nil {
+					ticker.Stop()
+					ticker = nil
+					tickerChan = nil
+				}
+			}
 
 		case event := <-notifyEvents:
 			// Add to pending events (debounce)
@@ -1074,7 +1058,7 @@ func (f *Fs) changeNotify(ctx context.Context, notify func(string, fs.EntryType)
 			debounceTimer = nil
 			debounceChan = nil
 
-		case <-ticker.C:
+		case <-tickerChan:
 			// Query for rows newer than lastTimestamp
 			query := fmt.Sprintf(`
 				SELECT media_key, file_name, COALESCE(name, '') as custom_name, COALESCE(path, '') as custom_path, COALESCE(size_bytes, 0) as size_bytes, COALESCE(utc_timestamp, 0) as utc_timestamp
@@ -1165,6 +1149,33 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		return nil, errNotWritable
 	}
 
+	// Wait for mount to be ready before uploading (max 5 seconds)
+	// This ensures the filesystem is accessible before background uploads start
+	select {
+	case <-f.mountReady:
+		// Mount is ready, proceed with upload
+	case <-time.After(5 * time.Second):
+		// Timeout - proceed anyway (handles non-mount usage like rclone copy)
+		fs.Debugf(f, "Mount ready timeout - proceeding with upload")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	// Skip zero-byte files - Google Photos doesn't accept them
+	// Return a dummy object to signal success so VFS removes the file from queue
+	if src.Size() == 0 {
+		fs.Infof(f, "Skipping zero-byte file: %s (Google Photos doesn't accept empty files)", src.Remote())
+		// Return a dummy object representing the "uploaded" empty file
+		// This tells VFS the upload succeeded and to remove it from the upload queue
+		return &Object{
+			fs:       f,
+			remote:   src.Remote(),
+			size:     0,
+			modTime:  src.ModTime(ctx),
+			mediaKey: "empty-file-skipped",
+		}, nil
+	}
+
 	// Use configured user for per-user mounts
 	userName := f.opt.User
 	filePath := src.Remote()
@@ -1176,7 +1187,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	}
 
 	// Upload to Google Photos
-	fs.Infof(f, "Uploading %s to Google Photos for user %s", fullPath, userName)
+	fs.Debugf(f, "Uploading %s to Google Photos for user %s", fullPath, userName)
 	mediaKey, err := f.UploadWithProgress(ctx, src, in, userName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to upload to Google Photos: %w", err)
@@ -1389,7 +1400,57 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 
 	if count > 0 {
-		return fmt.Errorf("directory not empty (has subfolders): %s", dir)
+		// Check if any subfolder contains visible items
+		// If all subfolders are empty (only contain hidden items), we can delete them
+		hasVisibleSubfolderContent := false
+		subfolderQuery := fmt.Sprintf(`
+			SELECT media_key FROM %s
+			WHERE user_name = $1 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2 AND type = -1
+				AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+		`, f.opt.TableName)
+		subRows, err := f.db.QueryContext(ctx, subfolderQuery, userName, folderPath)
+		if err != nil {
+			return fmt.Errorf("failed to query subfolders: %w", err)
+		}
+		defer subRows.Close()
+
+		var emptySubfolders []string
+		for subRows.Next() {
+			var subMediaKey string
+			if err := subRows.Scan(&subMediaKey); err != nil {
+				continue
+			}
+			// Extract subfolder path from media_key (format: folder:user:path)
+			parts := strings.SplitN(subMediaKey, ":", 3)
+			if len(parts) != 3 {
+				continue
+			}
+			subfolderPath := parts[2]
+
+			// Check if this subfolder has any visible content
+			visibleQuery := fmt.Sprintf(`
+				SELECT COUNT(*) FROM %s
+				WHERE user_name = $1 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2
+					AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+			`, f.opt.TableName)
+			var visibleCount int
+			f.db.QueryRowContext(ctx, visibleQuery, userName, subfolderPath).Scan(&visibleCount)
+			if visibleCount > 0 {
+				hasVisibleSubfolderContent = true
+				break
+			}
+			emptySubfolders = append(emptySubfolders, subMediaKey)
+		}
+
+		if hasVisibleSubfolderContent {
+			return fmt.Errorf("directory not empty (has subfolders): %s", dir)
+		}
+
+		// Delete empty subfolders
+		for _, subKey := range emptySubfolders {
+			delQuery := fmt.Sprintf(`DELETE FROM %s WHERE media_key = $1`, f.opt.TableName)
+			f.db.ExecContext(ctx, delQuery, subKey)
+		}
 	}
 
 	// Delete the folder row (folder's media_key is folder:user:fullPath)
@@ -1651,9 +1712,11 @@ func (o *Object) Remote() string {
 	return o.remote
 }
 
-// ModTime returns the modification time
+// ModTime returns the modification time truncated to day precision
+// This avoids VFS cache invalidation due to timestamp precision differences
 func (o *Object) ModTime(ctx context.Context) time.Time {
-	return o.modTime
+	// Truncate to start of day (midnight UTC) for stable fingerprints
+	return o.modTime.UTC().Truncate(24 * time.Hour)
 }
 
 // Size returns the size of the object
@@ -1676,86 +1739,98 @@ func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 	return fs.ErrorCantSetModTime
 }
 
-// Open opens the file for reading with URL caching and ETag support
-func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	// Check if we have cached metadata for this media key FIRST
+// fetchURLMetadata gets the download URL and metadata, using singleflight to coalesce duplicate requests
+func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 	cacheKey := o.mediaKey
-	cachedMeta, found := o.fs.urlCache.get(cacheKey)
 
-	var resolvedURL, etag string
-	var fileSize int64
+	// Check cache first (fast path)
+	if cachedMeta, found := o.fs.urlCache.get(cacheKey); found {
+		fs.Debugf(o, "URL cache hit for %s", o.remote)
+		return cachedMeta, nil
+	}
 
-	if found {
-		// Use cached metadata - skip API call entirely
-		resolvedURL = cachedMeta.resolvedURL
-		etag = cachedMeta.etag
-		fileSize = cachedMeta.size
-		fs.Debugf(nil, "URL cache hit for %s", o.mediaKey)
-	} else {
-		// Cache miss - need to get download URL from API
-		fs.Debugf(nil, "URL cache miss for %s", o.mediaKey)
+	// Use singleflight to coalesce duplicate requests for the same file
+	// If 10 calls request the same URL, only 1 actually fetches it
+	result, err, shared := o.fs.urlFetchGroup.Do(cacheKey, func() (interface{}, error) {
+		// Re-check cache (another goroutine may have populated it)
+		if cachedMeta, found := o.fs.urlCache.get(cacheKey); found {
+			fs.Debugf(o, "URL cache hit (after singleflight) for %s", o.remote)
+			return cachedMeta, nil
+		}
+
+		fs.Debugf(o, "Fetching download URL for %s", o.remote)
 
 		initialURL, err := o.fs.api.GetDownloadURL(ctx, o.mediaKey)
 		if err != nil {
-			// If media not found (404), delete from database and return not found error
 			if errors.Is(err, ErrMediaNotFound) {
-				fs.Infof(nil, "mediavfs: media item %s not found in Google Photos, removing from database", o.mediaKey)
+				fs.Errorf(o, "File not found in Google Photos: %s - removing from database", o.remote)
 				deleteQuery := fmt.Sprintf(`DELETE FROM %s WHERE media_key = $1`, o.fs.opt.TableName)
 				_, delErr := o.fs.db.ExecContext(ctx, deleteQuery, o.mediaKey)
 				if delErr != nil {
-					fs.Errorf(nil, "mediavfs: failed to delete missing media %s from database: %v", o.mediaKey, delErr)
+					fs.Errorf(o, "Failed to delete missing media from database: %v", delErr)
 				} else {
-					// Invalidate cache for the directory
 					o.fs.removeFromDirCache(o.displayPath, o.displayName)
 				}
 				return nil, fs.ErrorObjectNotFound
 			}
-			return nil, fmt.Errorf("failed to get download URL: %w", err)
+			fs.Errorf(o, "Failed to get download URL for %s: %v", o.remote, err)
+			return nil, fmt.Errorf("failed to get download URL for %s: %w", o.remote, err)
 		}
 
 		// Resolve URL and get ETag via HEAD request
-		fs.Debugf(nil, "Resolving URL for %s", o.mediaKey)
+		fs.Debugf(o, "Resolving URL for %s", o.remote)
 
-		// Retry HEAD request with exponential backoff for transient errors
 		var headResp *http.Response
 		var headErr error
 		for attempt := 0; attempt < 3; attempt++ {
 			if attempt > 0 {
 				sleepTime := time.Duration(1<<uint(attempt-1)) * time.Second
-				fs.Debugf(nil, "Retrying HEAD after %v", sleepTime)
+				fs.Debugf(o, "Retrying HEAD for %s after %v (attempt %d/3)", o.remote, sleepTime, attempt+1)
 				time.Sleep(sleepTime)
 			}
 
 			headReq, err := http.NewRequestWithContext(ctx, "HEAD", initialURL, nil)
 			if err != nil {
-				return nil, fmt.Errorf("failed to create HEAD request: %w", err)
+				return nil, fmt.Errorf("failed to create HEAD request for %s: %w", o.remote, err)
 			}
 			headReq.Header.Set("User-Agent", "AndroidDownloadManager/13")
 
 			headResp, headErr = o.fs.httpClient.Do(headReq)
 			if headErr == nil {
-				// Success - check if we should retry based on status code
-				if headResp.StatusCode == http.StatusTooManyRequests ||
-					headResp.StatusCode == http.StatusServiceUnavailable ||
-					headResp.StatusCode >= 500 {
+				if headResp.StatusCode == http.StatusTooManyRequests {
+					retryAfter := headResp.Header.Get("Retry-After")
+					waitTime := time.Duration(1<<uint(attempt)) * time.Second
+					if retryAfter != "" {
+						if seconds, err := strconv.Atoi(retryAfter); err == nil {
+							waitTime = time.Duration(seconds) * time.Second
+						}
+					}
+					fs.Infof(o, "Rate limited (429) for %s, waiting %v before retry", o.remote, waitTime)
 					headResp.Body.Close()
-					headErr = fmt.Errorf("transient HTTP error: %s (status %d)", headResp.Status, headResp.StatusCode)
+					time.Sleep(waitTime)
+					headErr = fmt.Errorf("rate limited (429)")
+					continue
+				}
+				if headResp.StatusCode == http.StatusServiceUnavailable || headResp.StatusCode >= 500 {
+					fs.Debugf(o, "Server error (%d) for %s: %s", headResp.StatusCode, o.remote, headResp.Status)
+					headResp.Body.Close()
+					headErr = fmt.Errorf("server error: %s (status %d)", headResp.Status, headResp.StatusCode)
 					continue
 				}
 				break // Success
+			} else {
+				fs.Debugf(o, "HEAD request failed for %s: %v", o.remote, headErr)
 			}
 		}
 
 		if headErr != nil {
-			return nil, fmt.Errorf("failed to execute HEAD request after retries: %w", headErr)
+			return nil, fmt.Errorf("failed to resolve URL for %s: %w", o.remote, headErr)
 		}
 		defer headResp.Body.Close()
 
-		// Get the final URL after any redirects
-		resolvedURL = headResp.Request.URL.String()
-
-		// Get ETag and size from headers
-		etag = headResp.Header.Get("ETag")
+		resolvedURL := headResp.Request.URL.String()
+		etag := headResp.Header.Get("ETag")
+		var fileSize int64
 		if contentLength := headResp.Header.Get("Content-Length"); contentLength != "" {
 			fmt.Sscanf(contentLength, "%d", &fileSize)
 		} else {
@@ -1763,28 +1838,55 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		}
 
 		// Cache the metadata
-		o.fs.urlCache.set(cacheKey, &urlMetadata{
+		meta := &urlMetadata{
 			resolvedURL: resolvedURL,
 			etag:        etag,
 			size:        fileSize,
-		})
+		}
+		o.fs.urlCache.set(cacheKey, meta)
+		fs.Debugf(o, "Cached URL for %s", o.remote)
 
-		fs.Debugf(nil, "Cached URL for %s", o.mediaKey)
+		return meta, nil
+	})
+
+	if err != nil {
+		return nil, err
 	}
 
+	if shared {
+		fs.Debugf(o, "URL fetch shared with another request for %s", o.remote)
+	}
+
+	return result.(*urlMetadata), nil
+}
+
+// Open opens the file for reading with URL caching and ETag support
+func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
+	// Get URL metadata (uses singleflight to coalesce duplicate requests)
+	meta, err := o.fetchURLMetadata(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	resolvedURL := meta.resolvedURL
+	etag := meta.etag
+	fileSize := meta.size
+
 	// Now make the actual GET request to the resolved URL with retry logic
+	fs.Debugf(o, "Downloading: %s", o.remote)
 	var res *http.Response
 	var getErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
 			sleepTime := time.Duration(1<<uint(attempt-1)) * time.Second
-			fs.Debugf(nil, "Retrying GET after %v", sleepTime)
+			fs.Debugf(o, "Retrying download for %s after %v (attempt %d/3)", o.remote, sleepTime, attempt+1)
 			time.Sleep(sleepTime)
 		}
 
 		req, err := http.NewRequestWithContext(ctx, "GET", resolvedURL, nil)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
+			fs.Errorf(o, "Failed to create GET request for %s: %v", o.remote, err)
+			return nil, fmt.Errorf("failed to create request for %s: %w", o.remote, err)
 		}
 
 		// Set User-Agent header
@@ -1809,25 +1911,44 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			}
 
 			// Check if we should retry based on status code
-			if res.StatusCode == http.StatusTooManyRequests ||
-				res.StatusCode == http.StatusServiceUnavailable ||
-				res.StatusCode >= 500 {
+			if res.StatusCode == http.StatusTooManyRequests {
+				// Rate limited - check Retry-After header
+				retryAfter := res.Header.Get("Retry-After")
+				waitTime := time.Duration(1<<uint(attempt)) * time.Second
+				if retryAfter != "" {
+					if seconds, err := strconv.Atoi(retryAfter); err == nil {
+						waitTime = time.Duration(seconds) * time.Second
+					}
+				}
+				fs.Infof(o, "Rate limited (429) downloading %s, waiting %v before retry", o.remote, waitTime)
 				res.Body.Close()
-				getErr = fmt.Errorf("transient HTTP error: %s (status %d)", res.Status, res.StatusCode)
+				time.Sleep(waitTime)
+				getErr = fmt.Errorf("rate limited (429)")
+				continue
+			}
+			if res.StatusCode == http.StatusServiceUnavailable ||
+				res.StatusCode >= 500 {
+				fs.Debugf(o, "Server error (%d) downloading %s: %s", res.StatusCode, o.remote, res.Status)
+				res.Body.Close()
+				getErr = fmt.Errorf("server error: %s (status %d)", res.Status, res.StatusCode)
 				continue
 			}
 
 			// Permanent error - don't retry
+			fs.Errorf(o, "Download failed for %s: HTTP %d %s", o.remote, res.StatusCode, res.Status)
 			res.Body.Close()
-			return nil, fmt.Errorf("HTTP error: %s (status %d)", res.Status, res.StatusCode)
+			return nil, fmt.Errorf("download failed for %s: HTTP %d %s", o.remote, res.StatusCode, res.Status)
+		} else {
+			fs.Debugf(o, "GET request failed for %s: %v", o.remote, getErr)
 		}
 	}
 
 	if getErr != nil {
-		return nil, fmt.Errorf("failed to open file after retries: %w", getErr)
+		fs.Errorf(o, "Failed to download %s after 3 attempts: %v", o.remote, getErr)
+		return nil, fmt.Errorf("failed to download %s: %w", o.remote, getErr)
 	}
 
-	fs.Debugf(nil, "Opened %s", o.mediaKey)
+	fs.Debugf(o, "Download started: %s (%d bytes)", o.remote, fileSize)
 
 	return res.Body, nil
 }
@@ -1847,35 +1968,88 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	return fmt.Errorf("cannot update existing file (size differs: local=%d remote=%d) - delete and re-upload instead", src.Size(), o.size)
 }
 
-// Remove marks a file for deletion (trash_timestamp = -1) and removes from VFS
-// Actual deletion from Google Photos happens in background batch process
+// Remove deletes a file - checks for duplicates first to prevent data loss
+// If file has duplicates (same dedup_key), only hides locally (trash_timestamp = -1)
+// If file is unique, deletes from Google Photos server and database
 func (o *Object) Remove(ctx context.Context) error {
 	if !o.fs.opt.EnableDelete {
 		fs.Debugf(o.fs, "Remove disabled for %s", o.Remote())
 		return nil
 	}
 
-	fs.Debugf(o.fs, "Marking %s for deletion", o.Remote())
+	fs.Debugf(o.fs, "Checking duplicates before removing %s", o.Remote())
 
-	// Mark for deletion by setting trash_timestamp = -1
-	// This removes it from listings immediately (trash_timestamp != 0 is filtered out)
-	query := fmt.Sprintf(`
-		UPDATE %s SET trash_timestamp = -1
-		WHERE media_key = $1
-	`, o.fs.opt.TableName)
-
-	_, err := o.fs.db.ExecContext(ctx, query, o.mediaKey)
+	// Get the dedup_key for this file
+	var dedupKey string
+	dedupQuery := fmt.Sprintf(`SELECT COALESCE(dedup_key, '') FROM %s WHERE media_key = $1`, o.fs.opt.TableName)
+	err := o.fs.db.QueryRowContext(ctx, dedupQuery, o.mediaKey).Scan(&dedupKey)
 	if err != nil {
-		return fmt.Errorf("failed to mark for deletion: %w", err)
+		return fmt.Errorf("failed to get dedup_key: %w", err)
 	}
 
-	// Remove from caches
+	// Count how many files share this dedup_key (excluding already trashed files)
+	var duplicateCount int
+	if dedupKey != "" {
+		countQuery := fmt.Sprintf(`
+			SELECT COUNT(*) FROM %s
+			WHERE dedup_key = $1
+			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+		`, o.fs.opt.TableName)
+		err = o.fs.db.QueryRowContext(ctx, countQuery, dedupKey).Scan(&duplicateCount)
+		if err != nil {
+			return fmt.Errorf("failed to count duplicates: %w", err)
+		}
+	} else {
+		// No dedup_key means we can't check for duplicates, treat as unique
+		duplicateCount = 1
+	}
+
+	// Remove from caches first
 	o.fs.removeFromDirCache(o.displayPath, o.displayName)
 	o.fs.lazyMu.Lock()
 	delete(o.fs.lazyMeta, o.remote)
 	o.fs.lazyMu.Unlock()
 
-	fs.Debugf(o.fs, "Marked %s for deletion (will be batch deleted)", o.Remote())
+	if duplicateCount <= 1 {
+		// This is the only copy - safe to delete from Google Photos
+		fs.Debugf(o.fs, "File %s is unique (no duplicates), deleting from Google Photos", o.Remote())
+
+		if dedupKey != "" {
+			// Delete from Google Photos
+			if err := o.fs.DeleteFromGPhotos(ctx, []string{dedupKey}, o.userName); err != nil {
+				fs.Errorf(o.fs, "Failed to delete from Google Photos: %v", err)
+				// Still mark as deleted locally even if Google delete fails
+			}
+		}
+
+		// Delete from database
+		deleteQuery := fmt.Sprintf(`DELETE FROM %s WHERE media_key = $1`, o.fs.opt.TableName)
+		_, err = o.fs.db.ExecContext(ctx, deleteQuery, o.mediaKey)
+		if err != nil {
+			return fmt.Errorf("failed to delete from database: %w", err)
+		}
+
+		fs.Infof(o.fs, "Deleted %s from Google Photos and database", o.Remote())
+	} else {
+		// Multiple copies exist - only hide locally to prevent data loss
+		fs.Debugf(o.fs, "File %s has %d copies, hiding locally only (not deleting from Google Photos)", o.Remote(), duplicateCount)
+
+		// Mark for local deletion by setting trash_timestamp = -1 and path = NULL
+		// Setting path = NULL ensures the file doesn't appear in parent directory listings,
+		// allowing parent folders to be removed without "folder not empty" errors
+		query := fmt.Sprintf(`
+			UPDATE %s SET trash_timestamp = -1, path = NULL
+			WHERE media_key = $1
+		`, o.fs.opt.TableName)
+
+		_, err = o.fs.db.ExecContext(ctx, query, o.mediaKey)
+		if err != nil {
+			return fmt.Errorf("failed to mark for deletion: %w", err)
+		}
+
+		fs.Infof(o.fs, "Hidden %s locally (has %d duplicates, not deleted from Google Photos)", o.Remote(), duplicateCount)
+	}
+
 	return nil
 }
 
@@ -1897,27 +2071,12 @@ func (f *Fs) startBackgroundSync() {
 			case <-f.syncStop:
 				return
 			case <-ticker.C:
-				// Process pending deletions first (batch delete from Google Photos)
-				if f.opt.EnableDelete {
-					for {
-						deleted, err := f.ProcessPendingDeletions(context.Background(), f.opt.User, 100)
-						if err != nil {
-							fs.Errorf(f, "Background deletion failed: %v", err)
-							break
-						}
-						if deleted == 0 {
-							break // No more pending deletions
-						}
-						// Check if we should stop
-						select {
-						case <-f.syncStop:
-							return
-						default:
-						}
-					}
-				}
+				// Note: We intentionally do NOT process pending deletions here.
+				// Files marked with trash_timestamp = -1 are hidden locally only.
+				// We don't delete from Google Photos to prevent data loss
+				// (deleting one file might remove all duplicates).
 
-				// Then sync from Google Photos
+				// Sync from Google Photos
 				if err := f.SyncFromGooglePhotos(context.Background(), f.opt.User); err != nil {
 					fs.Errorf(f, "Background sync failed: %v", err)
 				}
@@ -1926,10 +2085,206 @@ func (f *Fs) startBackgroundSync() {
 	}()
 }
 
+// ListR lists the objects and directories of the Fs starting
+// from dir recursively into out.
+//
+// dir should be "" to start from the root, and should not
+// have trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't found.
+//
+// It should call callback for each tranche of entries read.
+// These need not be returned in any particular order. If
+// callback returns an error then the listing will stop
+// immediately.
+func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) error {
+	// Signal mount is ready when ListR is called
+	f.mountReadyOnce.Do(func() {
+		fs.Debugf(f, "Mount ready - ListR called")
+		close(f.mountReady)
+	})
+
+	userName := f.opt.User
+	rootPath := strings.Trim(path.Join(f.root, dir), "/")
+
+	fs.Debugf(f, "ListR called for dir=%s rootPath=%s", dir, rootPath)
+
+	// Query ALL files and folders recursively under rootPath
+	// Files have path starting with rootPath (or equal to rootPath)
+	// This is a single query that gets everything
+	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
+	var query string
+	var rows *sql.Rows
+	var err error
+
+	if rootPath == "" {
+		// List everything for this user
+		query = fmt.Sprintf(`
+			SELECT
+				media_key,
+				file_name,
+				COALESCE(name, '') as custom_name,
+				COALESCE(path, '') as custom_path,
+				COALESCE(type, 0) as item_type,
+				COALESCE(size_bytes, 0) as size_bytes,
+				COALESCE(utc_timestamp, 0) as utc_timestamp
+			FROM %s
+			WHERE user_name = $1
+				AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+				AND (is_canonical IS NULL OR is_canonical = true)
+			ORDER BY path, type ASC, file_name ASC
+		`, f.opt.TableName)
+		rows, err = f.db.QueryContext(ctx, query, userName)
+	} else {
+		// List everything under rootPath (path = rootPath OR path starts with rootPath/)
+		query = fmt.Sprintf(`
+			SELECT
+				media_key,
+				file_name,
+				COALESCE(name, '') as custom_name,
+				COALESCE(path, '') as custom_path,
+				COALESCE(type, 0) as item_type,
+				COALESCE(size_bytes, 0) as size_bytes,
+				COALESCE(utc_timestamp, 0) as utc_timestamp
+			FROM %s
+			WHERE user_name = $1
+				AND (TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2
+				     OR COALESCE(path, '') LIKE $3)
+				AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+				AND (is_canonical IS NULL OR is_canonical = true)
+			ORDER BY path, type ASC, file_name ASC
+		`, f.opt.TableName)
+		rows, err = f.db.QueryContext(ctx, query, userName, rootPath, rootPath+"/%")
+	}
+
+	if err != nil {
+		return fmt.Errorf("ListR query failed: %w", err)
+	}
+	defer rows.Close()
+
+	// Collect entries in batches to send to callback
+	var entries fs.DirEntries
+	seenDirs := make(map[string]bool) // Track directories we've already added
+	const batchSize = 1000
+
+	for rows.Next() {
+		var (
+			mediaKey      string
+			fileName      string
+			customName    string
+			customPath    string
+			itemType      int64
+			sizeBytes     int64
+			timestampUnix int64
+		)
+		if err := rows.Scan(&mediaKey, &fileName, &customName, &customPath, &itemType, &sizeBytes, &timestampUnix); err != nil {
+			return fmt.Errorf("ListR scan failed: %w", err)
+		}
+
+		// Display name: use 'name' if set, else use 'file_name'
+		displayName := strings.Trim(fileName, "/")
+		if customName != "" {
+			displayName = strings.Trim(customName, "/")
+		}
+
+		if displayName == "" {
+			continue
+		}
+
+		// Calculate path relative to f.root
+		dbPath := strings.Trim(customPath, "/")
+		var relativePath string
+		if f.root == "" {
+			relativePath = dbPath
+		} else if dbPath == f.root {
+			relativePath = ""
+		} else if strings.HasPrefix(dbPath, f.root+"/") {
+			relativePath = strings.TrimPrefix(dbPath, f.root+"/")
+		} else if !strings.HasPrefix(dbPath, f.root) {
+			// Path doesn't match our root, skip
+			continue
+		} else {
+			relativePath = dbPath
+		}
+
+		// Build the remote path
+		var remote string
+		if relativePath == "" {
+			remote = displayName
+		} else {
+			remote = relativePath + "/" + displayName
+		}
+
+		// Also add parent directories that we haven't seen yet
+		if relativePath != "" {
+			parts := strings.Split(relativePath, "/")
+			for i := range parts {
+				dirPath := strings.Join(parts[:i+1], "/")
+				if !seenDirs[dirPath] {
+					seenDirs[dirPath] = true
+					entries = append(entries, fs.NewDir(dirPath, time.Time{}))
+				}
+			}
+		}
+
+		if itemType == -1 {
+			// This is a folder
+			if !seenDirs[remote] {
+				seenDirs[remote] = true
+				entries = append(entries, fs.NewDir(remote, time.Time{}))
+			}
+		} else {
+			// This is a file
+			timestamp := convertUnixTimestamp(timestampUnix)
+			obj := &Object{
+				fs:          f,
+				remote:      remote,
+				mediaKey:    mediaKey,
+				size:        sizeBytes,
+				modTime:     timestamp,
+				userName:    userName,
+				displayName: displayName,
+				displayPath: dbPath,
+			}
+			entries = append(entries, obj)
+
+			// Store in lazyMeta cache for fast NewObject lookups
+			f.lazyMu.Lock()
+			f.lazyMeta[remote] = obj
+			f.lazyMu.Unlock()
+		}
+
+		// Send batch to callback when we reach batchSize
+		if len(entries) >= batchSize {
+			err = callback(entries)
+			if err != nil {
+				return err
+			}
+			entries = nil
+		}
+	}
+
+	if err = rows.Err(); err != nil {
+		return fmt.Errorf("ListR iteration error: %w", err)
+	}
+
+	// Send remaining entries
+	if len(entries) > 0 {
+		err = callback(entries)
+		if err != nil {
+			return err
+		}
+	}
+
+	fs.Debugf(f, "ListR completed")
+	return nil
+}
+
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs       = (*Fs)(nil)
-	_ fs.Object   = (*Object)(nil)
-	_ fs.Mover    = (*Fs)(nil)
+	_ fs.Fs         = (*Fs)(nil)
+	_ fs.Object     = (*Object)(nil)
+	_ fs.Mover      = (*Fs)(nil)
 	_ fs.Shutdowner = (*Fs)(nil)
+	_ fs.ListRer    = (*Fs)(nil)
 )
