@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"strconv"
 	"strings"
@@ -31,6 +32,16 @@ const (
 	defaultTimeout = 60 * time.Second
 	maxRetries     = 10
 )
+
+// backoffWithJitter returns an exponential backoff duration with jitter.
+// The jitter helps prevent thundering herd when multiple clients retry simultaneously.
+// Returns: baseBackoff * 2^retry * (0.5 + random(0, 0.5))
+func backoffWithJitter(retry int, baseBackoff time.Duration) time.Duration {
+	backoff := baseBackoff * time.Duration(1<<uint(retry))
+	// Add jitter: multiply by 0.5 to 1.0
+	jitter := 0.5 + rand.Float64()*0.5
+	return time.Duration(float64(backoff) * jitter)
+}
 
 // API handles Google Photos API interactions
 type API struct {
@@ -250,10 +261,11 @@ func (api *API) request(ctx context.Context, method, url string, headers map[str
 		case http.StatusTooManyRequests: // 429
 			lastStatusCode = resp.StatusCode
 			// Check Retry-After header
-			backoff := time.Duration(1<<uint(retry)) * time.Second
+			backoff := backoffWithJitter(retry, time.Second)
 			if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
 				if seconds, err := strconv.Atoi(retryAfter); err == nil && seconds > 0 {
-					backoff = time.Duration(seconds) * time.Second
+					// Add jitter to Retry-After value too
+					backoff = time.Duration(float64(seconds)*(0.9+rand.Float64()*0.2)) * time.Second
 				}
 			}
 			// Minimum 5 second backoff for rate limits, max 60 seconds
@@ -274,11 +286,15 @@ func (api *API) request(ctx context.Context, method, url string, headers map[str
 
 		case http.StatusInternalServerError, http.StatusServiceUnavailable:
 			lastStatusCode = resp.StatusCode
-			// Log error body for debugging
+			// Log error body for debugging (truncate to avoid logging sensitive data)
 			body, _ := readResponseBody(resp)
 			resp.Body.Close()
-			fs.Errorf(nil, "gphoto: server error (%d), retry %d/5, body: %s", resp.StatusCode, retry+1, string(body))
-			backoff := time.Duration(1<<uint(retry)) * time.Second
+			bodyPreview := string(body)
+			if len(bodyPreview) > 200 {
+				bodyPreview = bodyPreview[:200] + "..."
+			}
+			fs.Errorf(nil, "gphoto: server error (%d), retry %d/5, body: %s", resp.StatusCode, retry+1, bodyPreview)
+			backoff := backoffWithJitter(retry, time.Second)
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()

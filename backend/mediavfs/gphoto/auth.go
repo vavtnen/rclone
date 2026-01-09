@@ -351,6 +351,7 @@ func (a *Auth) generateEphemeralKey() (map[string]interface{}, error) {
 }
 
 // decryptToken decrypts an encrypted token using Tink ECIES-AEAD-HKDF.
+// Returns an error if decryption fails - never returns encrypted tokens as fallback.
 func (a *Auth) decryptToken(encryptedToken, itMetadata string) (string, error) {
 	if a.ephemeralPrivateKey == nil {
 		return "", errors.New("no ephemeral private key available")
@@ -358,14 +359,12 @@ func (a *Auth) decryptToken(encryptedToken, itMetadata string) (string, error) {
 
 	ciphertext, err := base64URLDecode(encryptedToken)
 	if err != nil {
-		fs.Errorf(nil, "gphoto_auth: decrypt failed - base64 decode error: %v", err)
-		return encryptedToken, nil
+		return "", fmt.Errorf("decrypt failed - base64 decode error: %w", err)
 	}
 
 	// Minimum size: 5 (prefix) + 65 (EC point) + 12 (IV) + 16 (tag)
 	if len(ciphertext) < 98 {
-		fs.Errorf(nil, "gphoto_auth: decrypt failed - ciphertext too short: %d < 98", len(ciphertext))
-		return encryptedToken, nil
+		return "", fmt.Errorf("decrypt failed - ciphertext too short: %d < 98", len(ciphertext))
 	}
 
 	// Skip Tink prefix (5 bytes: 1 version + 4 key_id)
@@ -374,8 +373,7 @@ func (a *Auth) decryptToken(encryptedToken, itMetadata string) (string, error) {
 	aesCiphertext := ciphertext[70:]
 
 	if senderPubBytes[0] != 0x04 {
-		fs.Errorf(nil, "gphoto_auth: decrypt failed - expected EC point 0x04, got 0x%02x", senderPubBytes[0])
-		return encryptedToken, nil
+		return "", fmt.Errorf("decrypt failed - expected EC point 0x04, got 0x%02x", senderPubBytes[0])
 	}
 
 	// Extract X and Y coordinates
@@ -412,8 +410,7 @@ func (a *Auth) decryptToken(encryptedToken, itMetadata string) (string, error) {
 	hkdfReader := hkdf.New(sha256.New, hkdfIKM, nil, nil)
 	aesKey := make([]byte, 16) // AES-128
 	if _, err := io.ReadFull(hkdfReader, aesKey); err != nil {
-		fs.Errorf(nil, "gphoto_auth: decrypt failed - HKDF error: %v", err)
-		return encryptedToken, nil
+		return "", fmt.Errorf("decrypt failed - HKDF error: %w", err)
 	}
 
 	// AES-GCM decryption - try both with and without inner 5-byte prefix
@@ -440,8 +437,7 @@ func (a *Auth) decryptToken(encryptedToken, itMetadata string) (string, error) {
 
 	// Second try: no inner prefix
 	if len(aesCiphertext) < 28 {
-		fs.Errorf(nil, "gphoto_auth: decrypt failed - aesCiphertext too short: %d", len(aesCiphertext))
-		return encryptedToken, nil
+		return "", fmt.Errorf("decrypt failed - aesCiphertext too short: %d", len(aesCiphertext))
 	}
 
 	nonce = aesCiphertext[0:12]
@@ -450,20 +446,17 @@ func (a *Auth) decryptToken(encryptedToken, itMetadata string) (string, error) {
 	{
 		block, err := aes.NewCipher(aesKey)
 		if err != nil {
-			fs.Errorf(nil, "gphoto_auth: decrypt failed - AES cipher error: %v", err)
-			return encryptedToken, nil
+			return "", fmt.Errorf("decrypt failed - AES cipher error: %w", err)
 		}
 
 		aesGCM, err := cipher.NewGCM(block)
 		if err != nil {
-			fs.Errorf(nil, "gphoto_auth: decrypt failed - GCM error: %v", err)
-			return encryptedToken, nil
+			return "", fmt.Errorf("decrypt failed - GCM error: %w", err)
 		}
 
 		tokenBytes, decryptError = aesGCM.Open(nil, nonce, ciphertextWithTag, nil)
 		if decryptError != nil {
-			fs.Errorf(nil, "gphoto_auth: decrypt failed - GCM decrypt error: %v", decryptError)
-			return encryptedToken, nil
+			return "", fmt.Errorf("decrypt failed - GCM decrypt error: %w", decryptError)
 		}
 	}
 

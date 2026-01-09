@@ -35,6 +35,7 @@ type NotifyListener struct {
 	eventChan   chan MediaChangeEvent
 	stopChan    chan struct{}
 	stopOnce    sync.Once
+	mu          sync.RWMutex // Protects isListening
 	isListening bool
 }
 
@@ -73,7 +74,9 @@ func (nl *NotifyListener) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to listen on channel %s: %w", NotifyChannel, err)
 	}
 
+	nl.mu.Lock()
 	nl.isListening = true
+	nl.mu.Unlock()
 	fs.Debugf(nil, "pg_notify: listening on channel '%s' for user '%s'", NotifyChannel, nl.user)
 
 	// Start processing notifications in background
@@ -139,12 +142,16 @@ func (nl *NotifyListener) Events() <-chan MediaChangeEvent {
 func (nl *NotifyListener) Stop() error {
 	var err error
 	nl.stopOnce.Do(func() {
-		if !nl.isListening {
+		nl.mu.Lock()
+		wasListening := nl.isListening
+		nl.isListening = false
+		nl.mu.Unlock()
+
+		if !wasListening {
 			return
 		}
 
 		close(nl.stopChan)
-		nl.isListening = false
 
 		if nl.listener != nil {
 			if unlErr := nl.listener.Unlisten(NotifyChannel); unlErr != nil {
@@ -154,6 +161,13 @@ func (nl *NotifyListener) Stop() error {
 		}
 	})
 	return err
+}
+
+// IsListening returns whether the listener is currently active
+func (nl *NotifyListener) IsListening() bool {
+	nl.mu.RLock()
+	defer nl.mu.RUnlock()
+	return nl.isListening
 }
 
 // CreateNotifyTriggerSQL returns the SQL to create the notification trigger
