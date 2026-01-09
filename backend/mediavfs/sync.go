@@ -518,7 +518,7 @@ func (f *Fs) SyncFromGooglePhotos(ctx context.Context, user string) error {
 			return fmt.Errorf("initial sync failed: %w", err)
 		}
 	} else {
-		fs.Infof(f, "Starting incremental sync for user %s", user)
+		fs.Debugf(f, "Starting incremental sync for user %s", user)
 		if err := f.incrementalSync(ctx, api, user, state.StateToken); err != nil {
 			return fmt.Errorf("incremental sync failed: %w", err)
 		}
@@ -640,8 +640,13 @@ func (f *Fs) incrementalSync(ctx context.Context, api *gphoto.API, user string, 
 		return fmt.Errorf("failed to parse library response: %w", err)
 	}
 
+	// Track totals across all pages
+	totalUpdates := 0
+	totalDeletions := 0
+
 	// Insert/update media items
 	if len(mediaItems) > 0 {
+		totalUpdates += len(mediaItems)
 		fs.Infof(f, "Syncing %d updated items", len(mediaItems))
 		for _, item := range mediaItems {
 			fs.Infof(f, "  + %s (size=%d, key=%s)", item.FileName, item.SizeBytes, item.MediaKey)
@@ -653,6 +658,7 @@ func (f *Fs) incrementalSync(ctx context.Context, api *gphoto.API, user string, 
 
 	// Delete items
 	if len(deletions) > 0 {
+		totalDeletions += len(deletions)
 		fs.Infof(f, "Deleting %d items", len(deletions))
 		for _, key := range deletions {
 			fs.Infof(f, "  - %s", key)
@@ -675,6 +681,7 @@ func (f *Fs) incrementalSync(ctx context.Context, api *gphoto.API, user string, 
 		}
 
 		if len(mediaItems) > 0 {
+			totalUpdates += len(mediaItems)
 			for _, item := range mediaItems {
 				fs.Infof(f, "  + %s (size=%d, key=%s)", item.FileName, item.SizeBytes, item.MediaKey)
 			}
@@ -684,6 +691,7 @@ func (f *Fs) incrementalSync(ctx context.Context, api *gphoto.API, user string, 
 		}
 
 		if len(deletions) > 0 {
+			totalDeletions += len(deletions)
 			for _, key := range deletions {
 				fs.Infof(f, "  - %s", key)
 			}
@@ -698,8 +706,11 @@ func (f *Fs) incrementalSync(ctx context.Context, api *gphoto.API, user string, 
 		return fmt.Errorf("failed to update sync state: %w", err)
 	}
 
-	fs.Infof(f, "Incremental sync completed for user %s (%d updates, %d deletions)",
-		user, len(mediaItems), len(deletions))
+	// Only log completion when there were actual changes
+	if totalUpdates > 0 || totalDeletions > 0 {
+		fs.Infof(f, "Incremental sync completed for user %s (%d updates, %d deletions)",
+			user, totalUpdates, totalDeletions)
+	}
 	return nil
 }
 

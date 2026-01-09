@@ -19,7 +19,8 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/lib/pq" // PostgreSQL driver
+	"github.com/lib/pq"
+
 	"github.com/rclone/rclone/backend/mediavfs/gphoto"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -1072,23 +1073,33 @@ func (f *Fs) changeNotify(ctx context.Context, notify func(string, fs.EntryType)
 		dirsToInvalidate := make(map[string]bool)
 		hasDelete := false
 
+		// Collect media keys for non-DELETE events
+		var mediaKeys []string
 		for _, event := range pendingEvents {
 			if event.Action == "DELETE" {
 				hasDelete = true
-				continue
+			} else {
+				mediaKeys = append(mediaKeys, event.MediaKey)
 			}
+		}
 
-			// Query the specific media item to get its path
+		// Batch query all media items at once (fixes N+1 query pattern)
+		if len(mediaKeys) > 0 {
 			query := fmt.Sprintf(`
 				SELECT COALESCE(path, '') as custom_path
-				FROM %s WHERE media_key = $1 AND user_name = $2
+				FROM %s WHERE media_key = ANY($1) AND user_name = $2
 			`, f.opt.TableName)
 
-			var customPath string
-			err := f.db.QueryRowContext(ctx, query, event.MediaKey, f.opt.User).Scan(&customPath)
+			rows, err := f.db.QueryContext(ctx, query, pq.Array(mediaKeys), f.opt.User)
 			if err == nil {
-				displayPath := strings.Trim(customPath, "/")
-				dirsToInvalidate[displayPath] = true
+				defer rows.Close()
+				for rows.Next() {
+					var customPath string
+					if err := rows.Scan(&customPath); err == nil {
+						displayPath := strings.Trim(customPath, "/")
+						dirsToInvalidate[displayPath] = true
+					}
+				}
 			}
 		}
 
