@@ -3,6 +3,7 @@ package mediavfs
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/rclone/rclone/backend/mediavfs/gphoto"
 	"github.com/rclone/rclone/fs"
@@ -12,11 +13,28 @@ import (
 // Uses advisory lock to prevent "tuple concurrently updated" errors when
 // multiple instances start simultaneously
 func (f *Fs) SetupNotifyTrigger(ctx context.Context) error {
-	// Always update the function definition (CREATE OR REPLACE)
-	// This ensures any changes to the notification payload are applied on remount
-	functionSQL := gphoto.CreateNotifyFunctionSQL()
-	if _, err := f.db.ExecContext(ctx, functionSQL); err != nil {
-		return fmt.Errorf("failed to create/update notify function: %w", err)
+	// Check if function exists and has the expected payload fields
+	// This avoids unnecessary updates when multiple mounts are running
+	var funcSource string
+	funcCheckSQL := `SELECT COALESCE(prosrc, '') FROM pg_proc WHERE proname = 'notify_media_changes'`
+	if err := f.db.QueryRowContext(ctx, funcCheckSQL).Scan(&funcSource); err == nil {
+		// Function exists - check if it has all required fields (path is the newest)
+		if strings.Contains(funcSource, "'path'") {
+			fs.Debugf(f, "PostgreSQL notify function already up-to-date")
+		} else {
+			// Function exists but outdated - update it
+			fs.Debugf(f, "Updating PostgreSQL notify function to include path field")
+			functionSQL := gphoto.CreateNotifyFunctionSQL()
+			if _, err := f.db.ExecContext(ctx, functionSQL); err != nil {
+				return fmt.Errorf("failed to update notify function: %w", err)
+			}
+		}
+	} else {
+		// Function doesn't exist - create it
+		functionSQL := gphoto.CreateNotifyFunctionSQL()
+		if _, err := f.db.ExecContext(ctx, functionSQL); err != nil {
+			return fmt.Errorf("failed to create notify function: %w", err)
+		}
 	}
 
 	// Check if trigger already exists
