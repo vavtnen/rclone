@@ -12,7 +12,14 @@ import (
 // Uses advisory lock to prevent "tuple concurrently updated" errors when
 // multiple instances start simultaneously
 func (f *Fs) SetupNotifyTrigger(ctx context.Context) error {
-	// First check if trigger already exists
+	// Always update the function definition (CREATE OR REPLACE)
+	// This ensures any changes to the notification payload are applied on remount
+	functionSQL := gphoto.CreateNotifyFunctionSQL()
+	if _, err := f.db.ExecContext(ctx, functionSQL); err != nil {
+		return fmt.Errorf("failed to create/update notify function: %w", err)
+	}
+
+	// Check if trigger already exists
 	var exists bool
 	checkSQL := `SELECT EXISTS (
 		SELECT 1 FROM pg_trigger
@@ -23,7 +30,7 @@ func (f *Fs) SetupNotifyTrigger(ctx context.Context) error {
 	}
 
 	if exists {
-		fs.Debugf(f, "PostgreSQL notify trigger already exists on table '%s'", f.opt.TableName)
+		fs.Debugf(f, "PostgreSQL notify trigger already exists on table '%s', function updated", f.opt.TableName)
 		return nil
 	}
 
@@ -47,10 +54,9 @@ func (f *Fs) SetupNotifyTrigger(ctx context.Context) error {
 		return nil
 	}
 
-	// Create the trigger
-	sql := gphoto.CreateNotifyTriggerSQL(f.opt.TableName)
-	_, err := f.db.ExecContext(ctx, sql)
-	if err != nil {
+	// Create the trigger (function already exists)
+	triggerSQL := gphoto.CreateNotifyTriggerOnlySQL(f.opt.TableName)
+	if _, err := f.db.ExecContext(ctx, triggerSQL); err != nil {
 		return fmt.Errorf("failed to create notify trigger: %w", err)
 	}
 	fs.Debugf(f, "Created PostgreSQL notify trigger on table '%s'", f.opt.TableName)

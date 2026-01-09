@@ -171,9 +171,9 @@ func (nl *NotifyListener) IsListening() bool {
 	return nl.isListening
 }
 
-// CreateNotifyTriggerSQL returns the SQL to create the notification trigger
-// This should be run once during database setup
-func CreateNotifyTriggerSQL(tableName string) string {
+// CreateNotifyFunctionSQL returns the SQL to create/update the notification function
+// This uses CREATE OR REPLACE so it can be called on every mount to update the function
+func CreateNotifyFunctionSQL() string {
 	return fmt.Sprintf(`
 -- Create or replace the notification function
 CREATE OR REPLACE FUNCTION notify_media_changes()
@@ -209,7 +209,12 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
+`, NotifyChannel)
+}
 
+// CreateNotifyTriggerOnlySQL returns the SQL to create just the trigger (assumes function exists)
+func CreateNotifyTriggerOnlySQL(tableName string) string {
+	return fmt.Sprintf(`
 -- Drop existing trigger if exists
 DROP TRIGGER IF EXISTS media_changes_trigger ON %s;
 
@@ -217,6 +222,12 @@ DROP TRIGGER IF EXISTS media_changes_trigger ON %s;
 CREATE TRIGGER media_changes_trigger
 AFTER INSERT OR UPDATE OR DELETE ON %s
 FOR EACH ROW EXECUTE FUNCTION notify_media_changes();
-`, NotifyChannel, tableName, tableName)
+`, tableName, tableName)
+}
+
+// CreateNotifyTriggerSQL returns the SQL to create both function and trigger
+// Kept for backwards compatibility
+func CreateNotifyTriggerSQL(tableName string) string {
+	return CreateNotifyFunctionSQL() + CreateNotifyTriggerOnlySQL(tableName)
 }
 
