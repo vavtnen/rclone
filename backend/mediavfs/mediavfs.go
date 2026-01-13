@@ -1868,7 +1868,7 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 
 		initialURL, err := o.fs.api.GetDownloadURL(ctx, o.mediaKey)
 		if err != nil {
-			if errors.Is(err, ErrMediaNotFound) {
+			if errors.Is(err, gphoto.ErrMediaNotFound) {
 				fs.Errorf(o, "File not found in Google Photos: %s - marking as missing (trash_timestamp=-2)", o.remote)
 				// Set trash_timestamp = -2 to mark as missing/404 (user can see which files need re-upload)
 				// This hides the file from listings but keeps the record for user reference
