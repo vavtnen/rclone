@@ -1,4 +1,4 @@
-package mediavfs
+package gphoto
 
 import (
 	"context"
@@ -25,6 +25,7 @@ type MediaChangeEvent struct {
 	Action   string `json:"action"`    // INSERT, UPDATE, DELETE
 	UserName string `json:"user_name"` // User who owns the media
 	MediaKey string `json:"media_key"` // Media key affected
+	Path     string `json:"path"`      // File path (for cache invalidation)
 }
 
 // NotifyListener manages PostgreSQL LISTEN/NOTIFY for real-time updates
@@ -35,6 +36,7 @@ type NotifyListener struct {
 	eventChan   chan MediaChangeEvent
 	stopChan    chan struct{}
 	stopOnce    sync.Once
+	mu          sync.RWMutex // Protects isListening
 	isListening bool
 }
 
@@ -73,7 +75,9 @@ func (nl *NotifyListener) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to listen on channel %s: %w", NotifyChannel, err)
 	}
 
+	nl.mu.Lock()
 	nl.isListening = true
+	nl.mu.Unlock()
 	fs.Debugf(nil, "pg_notify: listening on channel '%s' for user '%s'", NotifyChannel, nl.user)
 
 	// Start processing notifications in background
@@ -139,12 +143,16 @@ func (nl *NotifyListener) Events() <-chan MediaChangeEvent {
 func (nl *NotifyListener) Stop() error {
 	var err error
 	nl.stopOnce.Do(func() {
-		if !nl.isListening {
+		nl.mu.Lock()
+		wasListening := nl.isListening
+		nl.isListening = false
+		nl.mu.Unlock()
+
+		if !wasListening {
 			return
 		}
 
 		close(nl.stopChan)
-		nl.isListening = false
 
 		if nl.listener != nil {
 			if unlErr := nl.listener.Unlisten(NotifyChannel); unlErr != nil {
@@ -156,9 +164,16 @@ func (nl *NotifyListener) Stop() error {
 	return err
 }
 
-// CreateNotifyTriggerSQL returns the SQL to create the notification trigger
-// This should be run once during database setup
-func CreateNotifyTriggerSQL(tableName string) string {
+// IsListening returns whether the listener is currently active
+func (nl *NotifyListener) IsListening() bool {
+	nl.mu.RLock()
+	defer nl.mu.RUnlock()
+	return nl.isListening
+}
+
+// CreateNotifyFunctionSQL returns the SQL to create/update the notification function
+// This uses CREATE OR REPLACE so it can be called on every mount to update the function
+func CreateNotifyFunctionSQL() string {
 	return fmt.Sprintf(`
 -- Create or replace the notification function
 CREATE OR REPLACE FUNCTION notify_media_changes()
@@ -167,21 +182,25 @@ DECLARE
     payload JSON;
     affected_user TEXT;
     affected_key TEXT;
+    affected_path TEXT;
 BEGIN
     -- Determine which row to use based on operation
     IF TG_OP = 'DELETE' THEN
         affected_user := OLD.user_name;
         affected_key := OLD.media_key;
+        affected_path := COALESCE(OLD.path, '');
     ELSE
         affected_user := NEW.user_name;
         affected_key := NEW.media_key;
+        affected_path := COALESCE(NEW.path, '');
     END IF;
 
-    -- Build JSON payload
+    -- Build JSON payload (includes path for direct cache invalidation)
     payload := json_build_object(
         'action', TG_OP,
         'user_name', affected_user,
-        'media_key', affected_key
+        'media_key', affected_key,
+        'path', affected_path
     );
 
     -- Send notification
@@ -190,7 +209,12 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
+`, NotifyChannel)
+}
 
+// CreateNotifyTriggerOnlySQL returns the SQL to create just the trigger (assumes function exists)
+func CreateNotifyTriggerOnlySQL(tableName string) string {
+	return fmt.Sprintf(`
 -- Drop existing trigger if exists
 DROP TRIGGER IF EXISTS media_changes_trigger ON %s;
 
@@ -198,54 +222,12 @@ DROP TRIGGER IF EXISTS media_changes_trigger ON %s;
 CREATE TRIGGER media_changes_trigger
 AFTER INSERT OR UPDATE OR DELETE ON %s
 FOR EACH ROW EXECUTE FUNCTION notify_media_changes();
-`, NotifyChannel, tableName, tableName)
+`, tableName, tableName)
 }
 
-// SetupNotifyTrigger creates the PostgreSQL trigger for notifications
-// Uses advisory lock to prevent "tuple concurrently updated" errors when
-// multiple instances start simultaneously
-func (f *Fs) SetupNotifyTrigger(ctx context.Context) error {
-	// First check if trigger already exists
-	var exists bool
-	checkSQL := `SELECT EXISTS (
-		SELECT 1 FROM pg_trigger
-		WHERE tgname = 'media_changes_trigger'
-	)`
-	if err := f.db.QueryRowContext(ctx, checkSQL).Scan(&exists); err != nil {
-		return fmt.Errorf("failed to check trigger existence: %w", err)
-	}
-
-	if exists {
-		fs.Debugf(f, "PostgreSQL notify trigger already exists on table '%s'", f.opt.TableName)
-		return nil
-	}
-
-	// Use advisory lock to prevent concurrent trigger creation
-	// Lock ID is a hash of the trigger name
-	lockSQL := `SELECT pg_advisory_lock(hashtext('media_changes_trigger_setup'))`
-	if _, err := f.db.ExecContext(ctx, lockSQL); err != nil {
-		return fmt.Errorf("failed to acquire advisory lock: %w", err)
-	}
-	defer func() {
-		unlockSQL := `SELECT pg_advisory_unlock(hashtext('media_changes_trigger_setup'))`
-		f.db.ExecContext(ctx, unlockSQL)
-	}()
-
-	// Check again after acquiring lock (another instance may have created it)
-	if err := f.db.QueryRowContext(ctx, checkSQL).Scan(&exists); err != nil {
-		return fmt.Errorf("failed to check trigger existence: %w", err)
-	}
-	if exists {
-		fs.Debugf(f, "PostgreSQL notify trigger created by another instance")
-		return nil
-	}
-
-	// Create the trigger
-	sql := CreateNotifyTriggerSQL(f.opt.TableName)
-	_, err := f.db.ExecContext(ctx, sql)
-	if err != nil {
-		return fmt.Errorf("failed to create notify trigger: %w", err)
-	}
-	fs.Debugf(f, "Created PostgreSQL notify trigger on table '%s'", f.opt.TableName)
-	return nil
+// CreateNotifyTriggerSQL returns the SQL to create both function and trigger
+// Kept for backwards compatibility
+func CreateNotifyTriggerSQL(tableName string) string {
+	return CreateNotifyFunctionSQL() + CreateNotifyTriggerOnlySQL(tableName)
 }
+

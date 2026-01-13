@@ -13,12 +13,13 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	_ "github.com/lib/pq" // PostgreSQL driver
+	"github.com/rclone/rclone/backend/mediavfs/gphoto"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
@@ -32,11 +33,46 @@ const (
 	maxSleep      = 2 * time.Second
 	decayConstant = 2
 	cacheTTL      = 2 * time.Hour // Cache resolved URLs and ETags for 2 hours
+
+	// Cache configuration
+	maxURLCacheSize    = 1000 // Maximum entries before LRU eviction
+	maxDirCacheSize    = 500  // Maximum directory cache entries
+	dirCacheTTL        = 5 * time.Minute
+	urlCacheCleanupPct = 25 // Percentage of oldest entries to remove on cleanup
+
+	// Database pool configuration
+	dbMaxOpenConns    = 10
+	dbMaxIdleConns    = 5
+	dbConnMaxLifetime = time.Hour
+
+	// HTTP configuration
+	defaultHTTPTimeout = 60 * time.Second
+
+	// Sync configuration
+	initialSyncTimeout = 30 * time.Minute // Maximum time for initial sync
+	syncPageTimeout    = 5 * time.Minute  // Timeout per sync page
 )
 
 var (
 	errNotWritable = errors.New("mediavfs is read-only - files cannot be created, modified, or deleted from database")
+
+	// validIdentifier matches safe SQL identifiers (alphanumeric and underscore, must start with letter or underscore)
+	validIdentifier = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 )
+
+// validateIdentifier checks if a string is a safe SQL identifier to prevent SQL injection
+func validateIdentifier(name string) error {
+	if name == "" {
+		return errors.New("identifier cannot be empty")
+	}
+	if len(name) > 63 { // PostgreSQL identifier limit
+		return fmt.Errorf("identifier too long: %d > 63 characters", len(name))
+	}
+	if !validIdentifier.MatchString(name) {
+		return fmt.Errorf("invalid identifier %q: must contain only alphanumeric characters and underscores, and start with a letter or underscore", name)
+	}
+	return nil
+}
 
 // urlMetadata stores cached URL resolution and ETag information
 type urlMetadata struct {
@@ -44,9 +80,10 @@ type urlMetadata struct {
 	etag        string
 	size        int64
 	expiresAt   time.Time
+	lastAccess  time.Time // For LRU eviction
 }
 
-// urlCache is a TTL cache for resolved URLs and their ETags
+// urlCache is a TTL cache for resolved URLs and their ETags with LRU eviction
 type urlCache struct {
 	cache map[string]*urlMetadata
 	mu    sync.RWMutex
@@ -59,8 +96,8 @@ func newURLCache() *urlCache {
 }
 
 func (c *urlCache) get(key string) (*urlMetadata, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock() // Need write lock to update lastAccess
+	defer c.mu.Unlock()
 
 	meta, ok := c.cache[key]
 	if !ok {
@@ -69,9 +106,12 @@ func (c *urlCache) get(key string) (*urlMetadata, bool) {
 
 	// Check if expired
 	if time.Now().After(meta.expiresAt) {
+		delete(c.cache, key) // Clean up expired entry
 		return nil, false
 	}
 
+	// Update last access time for LRU
+	meta.lastAccess = time.Now()
 	return meta, true
 }
 
@@ -79,17 +119,55 @@ func (c *urlCache) set(key string, meta *urlMetadata) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	meta.expiresAt = time.Now().Add(cacheTTL)
+	now := time.Now()
+	meta.expiresAt = now.Add(cacheTTL)
+	meta.lastAccess = now
 	c.cache[key] = meta
 
-	// Simple cleanup: remove expired entries if cache is too large
-	if len(c.cache) > 1000 {
-		for k, v := range c.cache {
-			if time.Now().After(v.expiresAt) {
-				delete(c.cache, k)
-			}
+	// LRU cleanup: if cache exceeds max size, remove oldest entries
+	if len(c.cache) > maxURLCacheSize {
+		c.evictOldestLocked()
+	}
+}
+
+// evictOldestLocked removes the oldest entries from the cache
+// Must be called with lock held
+func (c *urlCache) evictOldestLocked() {
+	now := time.Now()
+	targetSize := maxURLCacheSize - (maxURLCacheSize * urlCacheCleanupPct / 100)
+
+	// First pass: remove expired entries
+	for k, v := range c.cache {
+		if now.After(v.expiresAt) {
+			delete(c.cache, k)
 		}
 	}
+
+	// If still too large, remove oldest by lastAccess
+	for len(c.cache) > targetSize {
+		var oldestKey string
+		var oldestTime time.Time
+		first := true
+		for k, v := range c.cache {
+			if first || v.lastAccess.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = v.lastAccess
+				first = false
+			}
+		}
+		if oldestKey != "" {
+			delete(c.cache, oldestKey)
+		} else {
+			break
+		}
+	}
+}
+
+// invalidate removes an entry from the cache
+func (c *urlCache) invalidate(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.cache, key)
 }
 
 func init() {
@@ -180,7 +258,7 @@ type Fs struct {
 	db          *sql.DB
 	dbConnStr   string // stored for lazy notify listener start
 	httpClient  *http.Client
-	api         *GPhotoAPI // Google Photos API client for download URLs
+	api         *gphoto.API // Google Photos API client for download URLs
 	urlCache    *urlCache
 	urlFetchGroup singleflight.Group // Coalesces duplicate URL fetch requests
 	// lazyMeta stores metadata loaded asynchronously for large listings
@@ -197,8 +275,11 @@ type Fs struct {
 	folderCacheMu     sync.RWMutex
 	// syncStop channel to stop background sync goroutine
 	syncStop chan struct{}
+	// bgCtx is a context for background operations that can be cancelled on shutdown
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
 	// notifyListener for PostgreSQL LISTEN/NOTIFY real-time updates (lazy started)
-	notifyListener *NotifyListener
+	notifyListener *gphoto.NotifyListener
 	notifyOnce     sync.Once
 	// mountReady is closed when the mount is ready (ChangeNotify has been called)
 	// Put operations wait for this before uploading
@@ -283,10 +364,20 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 
-	// Debug: log config options
+	// Debug: log config options (avoid logging sensitive data)
 	fs.Debugf(nil, "mediavfs: NewFs called with name=%s root=%s", name, root)
 	fs.Debugf(nil, "mediavfs: Options: User=%s EnableUpload=%v EnableDelete=%v AutoSync=%v",
 		opt.User, opt.EnableUpload, opt.EnableDelete, opt.AutoSync)
+
+	// Validate table name to prevent SQL injection
+	if err := validateIdentifier(opt.TableName); err != nil {
+		return nil, fmt.Errorf("invalid table_name: %w", err)
+	}
+
+	// Validate database name
+	if err := validateIdentifier(opt.DBName); err != nil {
+		return nil, fmt.Errorf("invalid db_name: %w", err)
+	}
 
 	// Build the full connection string with database name
 	dbConnStr := buildConnectionString(opt.DBConnection, opt.DBName)
@@ -311,15 +402,15 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	// Set connection pool settings
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(time.Hour)
+	db.SetMaxOpenConns(dbMaxOpenConns)
+	db.SetMaxIdleConns(dbMaxIdleConns)
+	db.SetConnMaxLifetime(dbConnMaxLifetime)
 
 	// Create custom HTTP client with redirect handling that preserves headers
 	baseClient := fshttp.NewClient(ctx)
 	customClient := &http.Client{
 		Transport: baseClient.Transport,
-		Timeout:   60 * time.Second, // 60 second timeout to prevent indefinite hangs
+		Timeout:   defaultHTTPTimeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
 				return fmt.Errorf("stopped after 10 redirects")
@@ -346,6 +437,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		},
 	}
 
+	// Create background context for long-running operations
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+
 	f := &Fs{
 		name:              name,
 		root:              root,
@@ -359,19 +453,21 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		dirCache:          make(map[string]*dirCacheEntry),
 		folderExistsCache: make(map[string]bool),
 		syncStop:          make(chan struct{}),
+		bgCtx:             bgCtx,
+		bgCancel:          bgCancel,
 		mountReady:        make(chan struct{}),
 	}
 
 	// Initialize Google Photos API client for download URLs
 	// Use native auth if master_token is provided, otherwise fall back to token server
 	if opt.MasterToken != "" {
-		api, err := NewGPhotoAPIWithNativeAuth(opt.User, opt.TokenServerURL, opt.MasterToken, opt.PrivateKeyS, opt.AndroidID, customClient)
+		api, err := gphoto.NewAPIWithNativeAuth(opt.User, opt.TokenServerURL, opt.MasterToken, opt.PrivateKeyS, opt.AndroidID, customClient)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create API client with native auth: %w", err)
 		}
 		f.api = api
 	} else if opt.TokenServerURL != "" {
-		f.api = NewGPhotoAPI(opt.User, opt.TokenServerURL, customClient)
+		f.api = gphoto.NewAPI(opt.User, opt.TokenServerURL, customClient)
 	} else {
 		return nil, fmt.Errorf("either master_token or token_server_url must be provided")
 	}
@@ -408,8 +504,15 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		} else if !state.InitComplete {
 			fs.Infof(f, "Performing initial sync for user: %s", opt.User)
 			go func() {
-				if err := f.SyncFromGooglePhotos(context.Background(), opt.User); err != nil {
-					fs.Errorf(f, "Initial sync failed: %v", err)
+				// Use background context with timeout for initial sync
+				syncCtx, cancel := context.WithTimeout(f.bgCtx, initialSyncTimeout)
+				defer cancel()
+				if err := f.SyncFromGooglePhotos(syncCtx, opt.User); err != nil {
+					if syncCtx.Err() == context.DeadlineExceeded {
+						fs.Errorf(f, "Initial sync timed out after %v", initialSyncTimeout)
+					} else {
+						fs.Errorf(f, "Initial sync failed: %v", err)
+					}
 				}
 				// Start background sync after initial sync completes if enabled
 				if opt.AutoSync {
@@ -906,7 +1009,7 @@ func (f *Fs) ChangeNotify(ctx context.Context, notify func(string, fs.EntryType)
 func (f *Fs) startNotifyListener(ctx context.Context) {
 	f.notifyOnce.Do(func() {
 		fs.Debugf(f, "Starting PostgreSQL notify listener (mount detected)")
-		f.notifyListener = NewNotifyListener(f.dbConnStr, f.opt.User)
+		f.notifyListener = gphoto.NewNotifyListener(f.dbConnStr, f.opt.User)
 		if err := f.notifyListener.Start(ctx); err != nil {
 			fs.Errorf(f, "Failed to start notify listener (falling back to polling): %v", err)
 			f.notifyListener = nil
@@ -945,14 +1048,14 @@ func (f *Fs) changeNotify(ctx context.Context, notify func(string, fs.EntryType)
 	}
 
 	// Get notify listener events channel (may be nil if listener failed to start)
-	var notifyEvents <-chan MediaChangeEvent
+	var notifyEvents <-chan gphoto.MediaChangeEvent
 	if f.notifyListener != nil {
 		notifyEvents = f.notifyListener.Events()
 	}
 
 	// Debounce settings for batch processing
 	const debounceDelay = 200 * time.Millisecond
-	var pendingEvents []MediaChangeEvent
+	var pendingEvents []gphoto.MediaChangeEvent
 	var debounceTimer *time.Timer
 	var debounceChan <-chan time.Time
 
@@ -965,25 +1068,16 @@ func (f *Fs) changeNotify(ctx context.Context, notify func(string, fs.EntryType)
 		fs.Debugf(f, "mediavfs: Processing %d batched notifications", len(pendingEvents))
 
 		// Collect unique directories to invalidate
+		// Path is now included in notification payload - no DB query needed
 		dirsToInvalidate := make(map[string]bool)
 		hasDelete := false
 
 		for _, event := range pendingEvents {
 			if event.Action == "DELETE" {
 				hasDelete = true
-				continue
-			}
-
-			// Query the specific media item to get its path
-			query := fmt.Sprintf(`
-				SELECT COALESCE(path, '') as custom_path
-				FROM %s WHERE media_key = $1 AND user_name = $2
-			`, f.opt.TableName)
-
-			var customPath string
-			err := f.db.QueryRowContext(ctx, query, event.MediaKey, f.opt.User).Scan(&customPath)
-			if err == nil {
-				displayPath := strings.Trim(customPath, "/")
+			} else {
+				// Use path directly from notification payload
+				displayPath := strings.Trim(event.Path, "/")
 				dirsToInvalidate[displayPath] = true
 			}
 		}
@@ -1418,6 +1512,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		for subRows.Next() {
 			var subMediaKey string
 			if err := subRows.Scan(&subMediaKey); err != nil {
+				fs.Debugf(f, "Rmdir: failed to scan subfolder row: %v", err)
 				continue
 			}
 			// Extract subfolder path from media_key (format: folder:user:path)
@@ -1434,7 +1529,10 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 					AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 			`, f.opt.TableName)
 			var visibleCount int
-			f.db.QueryRowContext(ctx, visibleQuery, userName, subfolderPath).Scan(&visibleCount)
+			if err := f.db.QueryRowContext(ctx, visibleQuery, userName, subfolderPath).Scan(&visibleCount); err != nil {
+				fs.Errorf(f, "Rmdir: failed to check subfolder content: %v", err)
+				continue
+			}
 			if visibleCount > 0 {
 				hasVisibleSubfolderContent = true
 				break
@@ -1449,7 +1547,10 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		// Delete empty subfolders
 		for _, subKey := range emptySubfolders {
 			delQuery := fmt.Sprintf(`DELETE FROM %s WHERE media_key = $1`, f.opt.TableName)
-			f.db.ExecContext(ctx, delQuery, subKey)
+			if _, err := f.db.ExecContext(ctx, delQuery, subKey); err != nil {
+				fs.Debugf(f, "Rmdir: failed to delete empty subfolder %s: %v", subKey, err)
+				// Continue trying to delete other subfolders
+			}
 		}
 	}
 
@@ -1673,6 +1774,11 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 
 // Shutdown the backend, stopping background sync and closing connections
 func (f *Fs) Shutdown(ctx context.Context) error {
+	// Cancel background context to stop all background operations
+	if f.bgCancel != nil {
+		f.bgCancel()
+	}
+
 	// Stop background sync if running
 	if f.syncStop != nil {
 		close(f.syncStop)
@@ -2087,16 +2193,21 @@ func (f *Fs) startBackgroundSync() {
 	fs.Debugf(f, "Starting background sync every %v", interval)
 
 	go func() {
-		// Do immediate sync on startup
-		if err := f.SyncFromGooglePhotos(context.Background(), f.opt.User); err != nil {
+		// Do immediate sync on startup with timeout
+		syncCtx, cancel := context.WithTimeout(f.bgCtx, syncPageTimeout)
+		if err := f.SyncFromGooglePhotos(syncCtx, f.opt.User); err != nil {
 			fs.Errorf(f, "Initial background sync failed: %v", err)
 		}
+		cancel()
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
 		for {
 			select {
+			case <-f.bgCtx.Done():
+				fs.Debugf(f, "Background sync stopped: context cancelled")
+				return
 			case <-f.syncStop:
 				return
 			case <-ticker.C:
@@ -2105,10 +2216,16 @@ func (f *Fs) startBackgroundSync() {
 				// We don't delete from Google Photos to prevent data loss
 				// (deleting one file might remove all duplicates).
 
-				// Sync from Google Photos
-				if err := f.SyncFromGooglePhotos(context.Background(), f.opt.User); err != nil {
+				// Sync from Google Photos with timeout
+				syncCtx, cancel := context.WithTimeout(f.bgCtx, syncPageTimeout)
+				if err := f.SyncFromGooglePhotos(syncCtx, f.opt.User); err != nil {
+					if f.bgCtx.Err() != nil {
+						cancel()
+						return // Context cancelled, exit
+					}
 					fs.Errorf(f, "Background sync failed: %v", err)
 				}
+				cancel()
 			}
 		}
 	}()

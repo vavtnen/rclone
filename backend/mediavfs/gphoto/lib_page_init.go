@@ -1,4 +1,4 @@
-package mediavfs
+package gphoto
 
 // buildGetLibraryPageInitMessage creates the message for get_library_page_init
 // This is used during INITIAL SYNC to fetch batches of media items

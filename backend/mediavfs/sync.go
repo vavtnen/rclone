@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/lib/pq"
+	"github.com/rclone/rclone/backend/mediavfs/gphoto"
 	"github.com/rclone/rclone/fs"
 )
 
@@ -408,7 +409,7 @@ func (f *Fs) UpdateSyncState(ctx context.Context, stateToken, pageToken string, 
 }
 
 // InsertMediaItems inserts or updates media items in the database
-func (f *Fs) InsertMediaItems(ctx context.Context, items []MediaItem) error {
+func (f *Fs) InsertMediaItems(ctx context.Context, items []gphoto.MediaItem) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -517,7 +518,7 @@ func (f *Fs) SyncFromGooglePhotos(ctx context.Context, user string) error {
 			return fmt.Errorf("initial sync failed: %w", err)
 		}
 	} else {
-		fs.Infof(f, "Starting incremental sync for user %s", user)
+		fs.Debugf(f, "Starting incremental sync for user %s", user)
 		if err := f.incrementalSync(ctx, api, user, state.StateToken); err != nil {
 			return fmt.Errorf("incremental sync failed: %w", err)
 		}
@@ -530,7 +531,7 @@ func (f *Fs) SyncFromGooglePhotos(ctx context.Context, user string) error {
 // Workflow matches Python's _cache_init:
 // 1. Call get_library_state("") once to establish state_token
 // 2. Use get_library_page_init(page_token) for pagination
-func (f *Fs) initialSync(ctx context.Context, api *GPhotoAPI, user string) error {
+func (f *Fs) initialSync(ctx context.Context, api *gphoto.API, user string) error {
 	// Step 1: Get initial library state (establishes state_token)
 	fs.Debugf(f, "Getting initial library state")
 	response, err := api.GetLibraryState(ctx, "", "")
@@ -584,7 +585,7 @@ func (f *Fs) initialSync(ctx context.Context, api *GPhotoAPI, user string) error
 
 // processInitPages paginates through remaining items during initial sync
 // Matches Python's _process_pages_init
-func (f *Fs) processInitPages(ctx context.Context, api *GPhotoAPI, user string, stateToken string, pageToken string) error {
+func (f *Fs) processInitPages(ctx context.Context, api *gphoto.API, user string, stateToken string, pageToken string) error {
 	for pageToken != "" {
 		fs.Debugf(f, "Fetching next page (pageToken=%q)", pageToken)
 		response, err := api.GetLibraryPageInit(ctx, pageToken)
@@ -627,7 +628,7 @@ func (f *Fs) processInitPages(ctx context.Context, api *GPhotoAPI, user string, 
 }
 
 // incrementalSync performs an incremental sync from Google Photos
-func (f *Fs) incrementalSync(ctx context.Context, api *GPhotoAPI, user string, stateToken string) error {
+func (f *Fs) incrementalSync(ctx context.Context, api *gphoto.API, user string, stateToken string) error {
 	response, err := api.GetLibraryState(ctx, stateToken, "")
 	if err != nil {
 		return fmt.Errorf("failed to get library state: %w", err)
@@ -639,8 +640,13 @@ func (f *Fs) incrementalSync(ctx context.Context, api *GPhotoAPI, user string, s
 		return fmt.Errorf("failed to parse library response: %w", err)
 	}
 
+	// Track totals across all pages
+	totalUpdates := 0
+	totalDeletions := 0
+
 	// Insert/update media items
 	if len(mediaItems) > 0 {
+		totalUpdates += len(mediaItems)
 		fs.Infof(f, "Syncing %d updated items", len(mediaItems))
 		for _, item := range mediaItems {
 			fs.Infof(f, "  + %s (size=%d, key=%s)", item.FileName, item.SizeBytes, item.MediaKey)
@@ -652,6 +658,7 @@ func (f *Fs) incrementalSync(ctx context.Context, api *GPhotoAPI, user string, s
 
 	// Delete items
 	if len(deletions) > 0 {
+		totalDeletions += len(deletions)
 		fs.Infof(f, "Deleting %d items", len(deletions))
 		for _, key := range deletions {
 			fs.Infof(f, "  - %s", key)
@@ -674,6 +681,7 @@ func (f *Fs) incrementalSync(ctx context.Context, api *GPhotoAPI, user string, s
 		}
 
 		if len(mediaItems) > 0 {
+			totalUpdates += len(mediaItems)
 			for _, item := range mediaItems {
 				fs.Infof(f, "  + %s (size=%d, key=%s)", item.FileName, item.SizeBytes, item.MediaKey)
 			}
@@ -683,6 +691,7 @@ func (f *Fs) incrementalSync(ctx context.Context, api *GPhotoAPI, user string, s
 		}
 
 		if len(deletions) > 0 {
+			totalDeletions += len(deletions)
 			for _, key := range deletions {
 				fs.Infof(f, "  - %s", key)
 			}
@@ -697,22 +706,25 @@ func (f *Fs) incrementalSync(ctx context.Context, api *GPhotoAPI, user string, s
 		return fmt.Errorf("failed to update sync state: %w", err)
 	}
 
-	fs.Infof(f, "Incremental sync completed for user %s (%d updates, %d deletions)",
-		user, len(mediaItems), len(deletions))
+	// Only log completion when there were actual changes
+	if totalUpdates > 0 || totalDeletions > 0 {
+		fs.Infof(f, "Incremental sync completed for user %s (%d updates, %d deletions)",
+			user, totalUpdates, totalDeletions)
+	}
 	return nil
 }
 
 // parseLibraryResponse parses the Google Photos library response using protobuf decoding
-func parseLibraryResponse(response []byte, user string) (stateToken, pageToken string, items []MediaItem, deletions []string, err error) {
+func parseLibraryResponse(response []byte, user string) (stateToken, pageToken string, items []gphoto.MediaItem, deletions []string, err error) {
 	// Decode protobuf response to map structure
 	// Use DecodeDynamicMessage which keeps bytes as bytes (doesn't recursively decode)
-	data, err := DecodeDynamicMessage(response)
+	data, err := gphoto.DecodeDynamicMessage(response)
 	if err != nil {
 		return "", "", nil, nil, fmt.Errorf("failed to decode protobuf response: %w", err)
 	}
 
 	// Parse using the proper parser
-	newStateToken, newPageToken, mediaItems, mediaKeysToDelete, err := ParseDbUpdate(data)
+	newStateToken, newPageToken, mediaItems, mediaKeysToDelete, err := gphoto.ParseDbUpdate(data)
 	if err != nil {
 		return "", "", nil, nil, fmt.Errorf("failed to parse library update: %w", err)
 	}
