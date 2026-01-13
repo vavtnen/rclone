@@ -1797,6 +1797,10 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 
 			headResp, headErr = o.fs.httpClient.Do(headReq)
 			if headErr == nil {
+				// Check for success first
+				if headResp.StatusCode == http.StatusOK {
+					break // Success
+				}
 				if headResp.StatusCode == http.StatusTooManyRequests {
 					retryAfter := headResp.Header.Get("Retry-After")
 					waitTime := time.Duration(1<<uint(attempt)) * time.Second
@@ -1817,7 +1821,23 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 					headErr = fmt.Errorf("server error: %s (status %d)", headResp.Status, headResp.StatusCode)
 					continue
 				}
-				break // Success
+				// Handle 404 - resource not found, don't retry
+				if headResp.StatusCode == http.StatusNotFound {
+					fs.Errorf(o, "File not found (404) during URL resolution for %s - removing from database", o.remote)
+					headResp.Body.Close()
+					deleteQuery := fmt.Sprintf(`DELETE FROM %s WHERE media_key = $1`, o.fs.opt.TableName)
+					_, delErr := o.fs.db.ExecContext(ctx, deleteQuery, o.mediaKey)
+					if delErr != nil {
+						fs.Errorf(o, "Failed to delete missing media from database: %v", delErr)
+					} else {
+						o.fs.removeFromDirCache(o.displayPath, o.displayName)
+					}
+					return nil, fs.ErrorObjectNotFound
+				}
+				// Other permanent errors - don't retry
+				fs.Errorf(o, "HEAD request failed for %s: HTTP %d %s", o.remote, headResp.StatusCode, headResp.Status)
+				headResp.Body.Close()
+				return nil, fmt.Errorf("failed to resolve URL for %s: HTTP %d %s", o.remote, headResp.StatusCode, headResp.Status)
 			} else {
 				fs.Debugf(o, "HEAD request failed for %s: %v", o.remote, headErr)
 			}
