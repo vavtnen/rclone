@@ -1868,12 +1868,14 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 
 		initialURL, err := o.fs.api.GetDownloadURL(ctx, o.mediaKey)
 		if err != nil {
-			if errors.Is(err, gphoto.ErrMediaNotFound) {
-				fs.Errorf(o, "File not found in Google Photos: %s - removing from database", o.remote)
-				deleteQuery := fmt.Sprintf(`DELETE FROM %s WHERE media_key = $1`, o.fs.opt.TableName)
-				_, delErr := o.fs.db.ExecContext(ctx, deleteQuery, o.mediaKey)
-				if delErr != nil {
-					fs.Errorf(o, "Failed to delete missing media from database: %v", delErr)
+			if errors.Is(err, ErrMediaNotFound) {
+				fs.Errorf(o, "File not found in Google Photos: %s - marking as missing (trash_timestamp=-2)", o.remote)
+				// Set trash_timestamp = -2 to mark as missing/404 (user can see which files need re-upload)
+				// This hides the file from listings but keeps the record for user reference
+				updateQuery := fmt.Sprintf(`UPDATE %s SET trash_timestamp = -2 WHERE media_key = $1`, o.fs.opt.TableName)
+				_, updateErr := o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
+				if updateErr != nil {
+					fs.Errorf(o, "Failed to mark missing media in database: %v", updateErr)
 				} else {
 					o.fs.removeFromDirCache(o.displayPath, o.displayName)
 				}
@@ -1903,6 +1905,10 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 
 			headResp, headErr = o.fs.httpClient.Do(headReq)
 			if headErr == nil {
+				// Check for success first
+				if headResp.StatusCode == http.StatusOK {
+					break // Success
+				}
 				if headResp.StatusCode == http.StatusTooManyRequests {
 					retryAfter := headResp.Header.Get("Retry-After")
 					waitTime := time.Duration(1<<uint(attempt)) * time.Second
@@ -1923,7 +1929,25 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 					headErr = fmt.Errorf("server error: %s (status %d)", headResp.Status, headResp.StatusCode)
 					continue
 				}
-				break // Success
+				// Handle 404 - resource not found, don't retry
+				if headResp.StatusCode == http.StatusNotFound {
+					fs.Errorf(o, "File not found (404) during URL resolution for %s - marking as missing (trash_timestamp=-2)", o.remote)
+					headResp.Body.Close()
+					// Set trash_timestamp = -2 to mark as missing/404 (user can see which files need re-upload)
+					// This hides the file from listings but keeps the record for user reference
+					updateQuery := fmt.Sprintf(`UPDATE %s SET trash_timestamp = -2 WHERE media_key = $1`, o.fs.opt.TableName)
+					_, updateErr := o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
+					if updateErr != nil {
+						fs.Errorf(o, "Failed to mark missing media in database: %v", updateErr)
+					} else {
+						o.fs.removeFromDirCache(o.displayPath, o.displayName)
+					}
+					return nil, fs.ErrorObjectNotFound
+				}
+				// Other permanent errors - don't retry
+				fs.Errorf(o, "HEAD request failed for %s: HTTP %d %s", o.remote, headResp.StatusCode, headResp.Status)
+				headResp.Body.Close()
+				return nil, fmt.Errorf("failed to resolve URL for %s: HTTP %d %s", o.remote, headResp.StatusCode, headResp.Status)
 			} else {
 				fs.Debugf(o, "HEAD request failed for %s: %v", o.remote, headErr)
 			}
