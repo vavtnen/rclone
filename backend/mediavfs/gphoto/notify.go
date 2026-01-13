@@ -26,6 +26,7 @@ type MediaChangeEvent struct {
 	UserName string `json:"user_name"` // User who owns the media
 	MediaKey string `json:"media_key"` // Media key affected
 	Path     string `json:"path"`      // File path (for cache invalidation)
+	OldPath  string `json:"old_path"`  // Previous path (for UPDATE operations, to invalidate old cache)
 }
 
 // NotifyListener manages PostgreSQL LISTEN/NOTIFY for real-time updates
@@ -183,28 +184,38 @@ DECLARE
     affected_user TEXT;
     affected_key TEXT;
     affected_path TEXT;
+    old_path TEXT;
 BEGIN
     -- Determine which row to use based on operation
     IF TG_OP = 'DELETE' THEN
         affected_user := OLD.user_name;
         affected_key := OLD.media_key;
         affected_path := COALESCE(OLD.path, '');
-    ELSE
+        old_path := '';
+    ELSIF TG_OP = 'UPDATE' THEN
         affected_user := NEW.user_name;
         affected_key := NEW.media_key;
         affected_path := COALESCE(NEW.path, '');
+        old_path := COALESCE(OLD.path, '');
+    ELSE
+        -- INSERT
+        affected_user := NEW.user_name;
+        affected_key := NEW.media_key;
+        affected_path := COALESCE(NEW.path, '');
+        old_path := '';
     END IF;
 
-    -- Build JSON payload (includes path for direct cache invalidation)
+    -- Build JSON payload (includes both paths for cache invalidation on UPDATE)
     payload := json_build_object(
         'action', TG_OP,
         'user_name', affected_user,
         'media_key', affected_key,
-        'path', affected_path
+        'path', affected_path,
+        'old_path', old_path
     );
 
     -- Send notification
-    PERFORM pg_notify('%s', payload::text);
+    PERFORM pg_notify('%%s', payload::text);
 
     RETURN NEW;
 END;

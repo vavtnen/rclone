@@ -1079,6 +1079,15 @@ func (f *Fs) changeNotify(ctx context.Context, notify func(string, fs.EntryType)
 				// Use path directly from notification payload
 				displayPath := strings.Trim(event.Path, "/")
 				dirsToInvalidate[displayPath] = true
+
+				// For UPDATE events, also invalidate the old path if it changed
+				// This prevents stale cache entries when files are moved or path is set to NULL
+				if event.Action == "UPDATE" && event.OldPath != "" {
+					oldDisplayPath := strings.Trim(event.OldPath, "/")
+					if oldDisplayPath != displayPath {
+						dirsToInvalidate[oldDisplayPath] = true
+					}
+				}
 			}
 		}
 
