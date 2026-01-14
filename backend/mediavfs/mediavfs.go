@@ -2012,11 +2012,18 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	fileSize := meta.size
 
 	// Check if this is a range/seek request (not initial download)
+	// A range starting at 0 is still considered an initial download
 	isRangeRequest := false
 	for _, opt := range options {
-		switch opt.(type) {
-		case *fs.RangeOption, *fs.SeekOption:
-			isRangeRequest = true
+		switch x := opt.(type) {
+		case *fs.RangeOption:
+			if x.Start > 0 {
+				isRangeRequest = true
+			}
+		case *fs.SeekOption:
+			if x.Offset > 0 {
+				isRangeRequest = true
+			}
 		}
 	}
 
