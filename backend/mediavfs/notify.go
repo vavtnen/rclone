@@ -18,12 +18,12 @@ func (f *Fs) SetupNotifyTrigger(ctx context.Context) error {
 	var funcSource string
 	funcCheckSQL := `SELECT COALESCE(prosrc, '') FROM pg_proc WHERE proname = 'notify_media_changes'`
 	if err := f.db.QueryRowContext(ctx, funcCheckSQL).Scan(&funcSource); err == nil {
-		// Function exists - check if it has all required fields (path is the newest)
-		if strings.Contains(funcSource, "'path'") {
+		// Function exists - check if it has all required fields (old_path is the newest)
+		if strings.Contains(funcSource, "'old_path'") {
 			fs.Debugf(f, "PostgreSQL notify function already up-to-date")
 		} else {
 			// Function exists but outdated - update it
-			fs.Debugf(f, "Updating PostgreSQL notify function to include path field")
+			fs.Debugf(f, "Updating PostgreSQL notify function to include old_path field")
 			functionSQL := gphoto.CreateNotifyFunctionSQL()
 			if _, err := f.db.ExecContext(ctx, functionSQL); err != nil {
 				return fmt.Errorf("failed to update notify function: %w", err)
