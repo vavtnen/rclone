@@ -2011,6 +2011,20 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	etag := meta.etag
 	fileSize := meta.size
 
+	// Check if this is a range/seek request (not initial download)
+	isRangeRequest := false
+	for _, opt := range options {
+		switch opt.(type) {
+		case *fs.RangeOption, *fs.SeekOption:
+			isRangeRequest = true
+		}
+	}
+
+	// Log info message only for initial download, not for seeks
+	if !isRangeRequest {
+		fs.Infof(o, "Starting download: %s", o.remote)
+	}
+
 	// Now make the actual GET request to the resolved URL with retry logic
 	fs.Debugf(o, "Downloading: %s", o.remote)
 	var res *http.Response
