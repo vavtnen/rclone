@@ -2148,29 +2148,26 @@ func (o *Object) Remove(ctx context.Context) error {
 
 	fs.Debugf(o.fs, "Checking duplicates before removing %s", o.Remote())
 
-	// Get the dedup_key for this file
+	// Get dedup_key and count duplicates in a single query for better performance
 	var dedupKey string
-	dedupQuery := fmt.Sprintf(`SELECT COALESCE(dedup_key, '') FROM %s WHERE media_key = $1`, o.fs.opt.TableName)
-	err := o.fs.db.QueryRowContext(ctx, dedupQuery, o.mediaKey).Scan(&dedupKey)
-	if err != nil {
-		return fmt.Errorf("failed to get dedup_key: %w", err)
-	}
-
-	// Count how many files share this dedup_key (excluding already trashed files)
 	var duplicateCount int
-	if dedupKey != "" {
-		countQuery := fmt.Sprintf(`
-			SELECT COUNT(*) FROM %s
-			WHERE dedup_key = $1
-			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-		`, o.fs.opt.TableName)
-		err = o.fs.db.QueryRowContext(ctx, countQuery, dedupKey).Scan(&duplicateCount)
-		if err != nil {
-			return fmt.Errorf("failed to count duplicates: %w", err)
-		}
-	} else {
-		// No dedup_key means we can't check for duplicates, treat as unique
-		duplicateCount = 1
+	query := fmt.Sprintf(`
+		SELECT
+			COALESCE(m.dedup_key, '') as dedup_key,
+			CASE
+				WHEN m.dedup_key IS NULL OR m.dedup_key = '' THEN 1
+				ELSE (
+					SELECT COUNT(*) FROM %s
+					WHERE dedup_key = m.dedup_key
+					AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+				)
+			END as duplicate_count
+		FROM %s m
+		WHERE m.media_key = $1
+	`, o.fs.opt.TableName, o.fs.opt.TableName)
+	err := o.fs.db.QueryRowContext(ctx, query, o.mediaKey).Scan(&dedupKey, &duplicateCount)
+	if err != nil {
+		return fmt.Errorf("failed to get dedup_key and count duplicates: %w", err)
 	}
 
 	// Remove from caches first
