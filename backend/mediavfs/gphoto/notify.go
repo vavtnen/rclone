@@ -215,7 +215,7 @@ BEGIN
     );
 
     -- Send notification
-    PERFORM pg_notify('%%s', payload::text);
+    PERFORM pg_notify('%s', payload::text);
 
     RETURN NEW;
 END;
