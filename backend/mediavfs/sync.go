@@ -111,16 +111,6 @@ func (f *Fs) InitializeDatabase(ctx context.Context) error {
 		return fmt.Errorf("failed to create path indices: %w", err)
 	}
 
-	// Add index for duplicate detection (user_name, file_name, path)
-	dupIndexQuery := fmt.Sprintf(`
-		CREATE INDEX IF NOT EXISTS idx_%s_user_filename_path ON %s(user_name, file_name, path);
-	`, f.opt.TableName, f.opt.TableName)
-
-	_, err = f.db.ExecContext(ctx, dupIndexQuery)
-	if err != nil {
-		return fmt.Errorf("failed to create duplicate detection index: %w", err)
-	}
-
 	// Normalize paths - strip trailing slashes from all paths
 	if err := f.normalizePathsInDB(ctx); err != nil {
 		fs.Errorf(f, "Failed to normalize paths (non-fatal): %v", err)
@@ -511,51 +501,6 @@ func (f *Fs) DeleteMediaItems(ctx context.Context, mediaKeys []string) error {
 	return nil
 }
 
-// MoveDuplicatesToRoot moves older duplicate files (same user_name, file_name, path) to root.
-// When a user restores a file from trash after uploading a new file with the same name,
-// we end up with duplicates. This function keeps the newest file (by server_creation_timestamp)
-// in place and moves older duplicates to root (path = NULL).
-func (f *Fs) MoveDuplicatesToRoot(ctx context.Context) error {
-	// Find and move duplicates in a single query
-	// ROW_NUMBER orders by server_creation_timestamp DESC, so rn=1 is newest (stays in place)
-	// rn > 1 are older duplicates that get moved to root
-	query := fmt.Sprintf(`
-		WITH ranked AS (
-			SELECT
-				media_key,
-				file_name,
-				path,
-				ROW_NUMBER() OVER (
-					PARTITION BY user_name, file_name, path
-					ORDER BY server_creation_timestamp DESC
-				) as rn
-			FROM %s
-			WHERE user_name = $1
-			AND type >= 0
-			AND (trash_timestamp IS NULL OR trash_timestamp >= 0)
-		)
-		UPDATE %s
-		SET path = NULL
-		WHERE media_key IN (
-			SELECT media_key
-			FROM ranked
-			WHERE rn > 1
-		)
-	`, f.opt.TableName, f.opt.TableName)
-
-	result, err := f.db.ExecContext(ctx, query, f.opt.User)
-	if err != nil {
-		return fmt.Errorf("failed to move duplicates to root: %w", err)
-	}
-
-	rows, _ := result.RowsAffected()
-	if rows > 0 {
-		fs.Infof(f, "Moved %d duplicate files to root for user %s", rows, f.opt.User)
-	}
-
-	return nil
-}
-
 // SyncFromGooglePhotos syncs media from Google Photos to the database
 func (f *Fs) SyncFromGooglePhotos(ctx context.Context, user string) error {
 	// Use the shared API client (with native auth if configured)
@@ -632,11 +577,6 @@ func (f *Fs) initialSync(ctx context.Context, api *gphoto.API, user string) erro
 	// Mark initial sync as complete
 	if err := f.UpdateSyncState(ctx, stateToken, "", true); err != nil {
 		return fmt.Errorf("failed to mark sync complete: %w", err)
-	}
-
-	// Move any duplicate files to root (handles restored files with same name)
-	if err := f.MoveDuplicatesToRoot(ctx); err != nil {
-		fs.Errorf(f, "Failed to move duplicates to root (non-fatal): %v", err)
 	}
 
 	fs.Infof(f, "Initial sync completed for user %s", user)
@@ -764,11 +704,6 @@ func (f *Fs) incrementalSync(ctx context.Context, api *gphoto.API, user string, 
 	// Update state
 	if err := f.UpdateSyncState(ctx, newStateToken, "", true); err != nil {
 		return fmt.Errorf("failed to update sync state: %w", err)
-	}
-
-	// Move any duplicate files to root (handles restored files with same name)
-	if err := f.MoveDuplicatesToRoot(ctx); err != nil {
-		fs.Errorf(f, "Failed to move duplicates to root (non-fatal): %v", err)
 	}
 
 	// Only log completion when there were actual changes
