@@ -2016,6 +2016,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	var res *http.Response
 	var getErr error
 	for attempt := 0; attempt < 3; attempt++ {
+		// Check if context is already canceled before attempting
+		if errors.Is(ctx.Err(), context.Canceled) {
+			fs.Debugf(o, "Download canceled for %s (seek/scan)", o.remote)
+			return nil, ctx.Err()
+		}
+
 		if attempt > 0 {
 			sleepTime := time.Duration(1<<uint(attempt-1)) * time.Second
 			fs.Debugf(o, "Retrying download for %s after %v (attempt %d/3)", o.remote, sleepTime, attempt+1)
@@ -2078,11 +2084,21 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			res.Body.Close()
 			return nil, fmt.Errorf("download failed for %s: HTTP %d %s", o.remote, res.StatusCode, res.Status)
 		} else {
+			// Check if error is due to context cancellation (user seek/scan)
+			if errors.Is(getErr, context.Canceled) {
+				fs.Debugf(o, "Download canceled for %s (seek/scan)", o.remote)
+				return nil, getErr
+			}
 			fs.Debugf(o, "GET request failed for %s: %v", o.remote, getErr)
 		}
 	}
 
 	if getErr != nil {
+		// Don't log context canceled as error - it's expected during seek/scan
+		if errors.Is(getErr, context.Canceled) {
+			fs.Debugf(o, "Download canceled for %s (seek/scan)", o.remote)
+			return nil, getErr
+		}
 		fs.Errorf(o, "Failed to download %s after 3 attempts: %v", o.remote, getErr)
 		return nil, fmt.Errorf("failed to download %s: %w", o.remote, getErr)
 	}
