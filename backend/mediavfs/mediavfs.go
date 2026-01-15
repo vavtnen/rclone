@@ -1367,10 +1367,10 @@ func (f *Fs) ensureFoldersExist(ctx context.Context, userName string, folderPath
 			mediaKey := fmt.Sprintf("folder:%s:%s", userName, fullPath)
 
 			// Insert folder if not exists (type = -1 for folders)
-			// path = parent's path, file_name = folder's name
+			// path = parent's path, file_name = folder's name, name = '' (not NULL)
 			query := fmt.Sprintf(`
-				INSERT INTO %s (media_key, file_name, path, type, user_name)
-				VALUES ($1, $2, $3, -1, $4)
+				INSERT INTO %s (media_key, file_name, name, path, type, user_name)
+				VALUES ($1, $2, '', $3, -1, $4)
 				ON CONFLICT (media_key) DO NOTHING
 			`, f.opt.TableName)
 

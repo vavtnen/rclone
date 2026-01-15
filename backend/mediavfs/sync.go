@@ -177,14 +177,15 @@ func (f *Fs) createMissingFolders(ctx context.Context) error {
 			WHERE full_path != ''
 			AND full_path NOT IN (SELECT folder_path FROM existing_folders)
 		)
-		-- Insert missing folder rows
-		INSERT INTO %s (media_key, file_name, path, type, user_name)
+		-- Insert missing folder rows (name = '' to avoid NULL)
+		INSERT INTO %s (media_key, file_name, name, path, type, user_name)
 		SELECT
 			'folder:' || $1 || ':' || full_path,
 			CASE
 				WHEN full_path NOT LIKE '%%/%%' THEN full_path
 				ELSE REGEXP_REPLACE(full_path, '^.+/', '')
 			END,
+			'',
 			CASE
 				WHEN full_path NOT LIKE '%%/%%' THEN ''
 				ELSE REGEXP_REPLACE(full_path, '/[^/]+$', '')
@@ -285,10 +286,11 @@ func (f *Fs) migrateFoldersFromPaths(ctx context.Context) error {
 			FROM all_dirs
 			WHERE full_path != ''
 		)
-		INSERT INTO %s (media_key, file_name, path, type, user_name)
+		INSERT INTO %s (media_key, file_name, name, path, type, user_name)
 		SELECT
 			'folder:' || $1 || ':' || full_path,
 			folder_name,
+			'',
 			parent_path,
 			-1,
 			$1
