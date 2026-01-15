@@ -1998,9 +1998,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		}
 	}
 
-	// Log info message only for initial download, not for seeks
+	// Log debug message only for initial download, not for seeks
 	if !isRangeRequest {
-		fs.Infof(o, "Starting download: %s", o.remote)
+		fs.Debugf(o, "Starting download: %s", o.remote)
 	}
 
 	// Now make the actual GET request to the resolved URL with retry logic
