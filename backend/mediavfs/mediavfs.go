@@ -323,6 +323,12 @@ func convertUnixTimestamp(timestamp int64) time.Time {
 	return time.Unix(timestamp, 0)
 }
 
+// normalizePath removes leading and trailing slashes from a path.
+// This ensures consistency with the database normalization done at startup.
+func normalizePath(p string) string {
+	return strings.Trim(p, "/")
+}
+
 // Name of the remote (as passed into NewFs)
 func (f *Fs) Name() string {
 	return f.name
@@ -660,18 +666,18 @@ func (f *Fs) listUserFiles(ctx context.Context, userName string, dirPath string)
 	// Folders have type = -1, files have type >= 0
 	// Exclude trashed items (trash_timestamp > 0)
 	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
-	// Trim trailing slashes from path for comparison
+	// Paths are normalized at startup so we can use direct comparison
 	query := fmt.Sprintf(`
 		SELECT
 			media_key,
 			file_name,
-			COALESCE(name, '') as custom_name,
-			COALESCE(path, '') as custom_path,
+			name,
+			path,
 			COALESCE(type, 0) as item_type,
 			COALESCE(size_bytes, 0) as size_bytes,
 			COALESCE(utc_timestamp, 0) as utc_timestamp
 		FROM %s
-		WHERE user_name = $1 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2
+		WHERE user_name = $1 AND path = $2
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 			AND (is_canonical IS NULL OR is_canonical = true)
 		ORDER BY type ASC, file_name ASC
@@ -834,10 +840,12 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	// Directory was prefetched but file not found - check if it's a folder
 	// This is a single query for the specific file/folder
 	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
+	// Paths are normalized at startup, construct full path with CASE for root level
 	folderQuery := fmt.Sprintf(`
 		SELECT type FROM %s
 		WHERE user_name = $1
-			AND TRIM(BOTH '/' FROM COALESCE(path, '')) || '/' || TRIM(BOTH '/' FROM COALESCE(NULLIF(name, ''), file_name)) = $2
+			AND CASE WHEN path = '' THEN COALESCE(NULLIF(name, ''), file_name)
+			         ELSE path || '/' || COALESCE(NULLIF(name, ''), file_name) END = $2
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 			AND (is_canonical IS NULL OR is_canonical = true)
 		LIMIT 1
@@ -858,19 +866,21 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 	// Fallback: file exists but wasn't in cache (shouldn't normally happen)
 	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
+	// Paths are normalized at startup
 	query := fmt.Sprintf(`
 		SELECT
 			media_key,
 			file_name,
-			COALESCE(name, '') as custom_name,
-			COALESCE(path, '') as custom_path,
+			name,
+			path,
 			COALESCE(size_bytes, 0) as size_bytes,
 			COALESCE(utc_timestamp, 0) as utc_timestamp
 		FROM %s
 		WHERE user_name = $1
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 			AND (is_canonical IS NULL OR is_canonical = true)
-			AND TRIM(BOTH '/' FROM COALESCE(path, '')) || '/' || TRIM(BOTH '/' FROM COALESCE(NULLIF(name, ''), file_name)) = $2
+			AND CASE WHEN path = '' THEN COALESCE(NULLIF(name, ''), file_name)
+			         ELSE path || '/' || COALESCE(NULLIF(name, ''), file_name) END = $2
 		LIMIT 1
 	`, f.opt.TableName)
 
@@ -1163,8 +1173,9 @@ func (f *Fs) changeNotify(ctx context.Context, notify func(string, fs.EntryType)
 
 		case <-tickerChan:
 			// Query for rows newer than lastTimestamp
+			// Paths are normalized at startup
 			query := fmt.Sprintf(`
-				SELECT media_key, file_name, COALESCE(name, '') as custom_name, COALESCE(path, '') as custom_path, COALESCE(size_bytes, 0) as size_bytes, COALESCE(utc_timestamp, 0) as utc_timestamp
+				SELECT media_key, file_name, name, path, COALESCE(size_bytes, 0) as size_bytes, COALESCE(utc_timestamp, 0) as utc_timestamp
 				FROM %s
 				WHERE user_name = $1 AND utc_timestamp > $2
 				ORDER BY utc_timestamp
@@ -1299,12 +1310,12 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	// Parse path and name for database insert
 	// file_name = original filename only (no path)
 	// name = display name (same as file_name for uploads)
-	// path = directory path
+	// path = directory path (normalized - no leading/trailing slashes)
 	fileName := path.Base(src.Remote()) // Original filename only
 	var displayPath string
 	if strings.Contains(fullPath, "/") {
 		lastSlash := strings.LastIndex(fullPath, "/")
-		displayPath = fullPath[:lastSlash]
+		displayPath = normalizePath(fullPath[:lastSlash])
 	} else {
 		displayPath = ""
 	}
@@ -1472,10 +1483,10 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	userName := f.opt.User
 
 	// Check if folder has any files (files have path = folderPath)
-	// Exclude trashed items, trim trailing slashes from path
+	// Exclude trashed items, paths are normalized at startup
 	checkFilesQuery := fmt.Sprintf(`
 		SELECT COUNT(*) FROM %s
-		WHERE user_name = $1 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2 AND type != -1
+		WHERE user_name = $1 AND path = $2 AND type != -1
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 	`, f.opt.TableName)
 
@@ -1490,10 +1501,10 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 
 	// Check for subfolders (subfolders have path = folderPath, type = -1)
-	// Exclude trashed items, trim trailing slashes from path
+	// Exclude trashed items, paths are normalized at startup
 	checkSubfoldersQuery := fmt.Sprintf(`
 		SELECT COUNT(*) FROM %s
-		WHERE user_name = $1 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2 AND type = -1
+		WHERE user_name = $1 AND path = $2 AND type = -1
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 	`, f.opt.TableName)
 
@@ -1508,7 +1519,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		hasVisibleSubfolderContent := false
 		subfolderQuery := fmt.Sprintf(`
 			SELECT media_key FROM %s
-			WHERE user_name = $1 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2 AND type = -1
+			WHERE user_name = $1 AND path = $2 AND type = -1
 				AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 		`, f.opt.TableName)
 		subRows, err := f.db.QueryContext(ctx, subfolderQuery, userName, folderPath)
@@ -1534,7 +1545,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 			// Check if this subfolder has any visible content
 			visibleQuery := fmt.Sprintf(`
 				SELECT COUNT(*) FROM %s
-				WHERE user_name = $1 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2
+				WHERE user_name = $1 AND path = $2
 					AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 			`, f.opt.TableName)
 			var visibleCount int
@@ -1731,11 +1742,11 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	}
 
 	// Update all items (files and subfolders) that have path = srcPath
-	// Trim trailing slashes from path for comparison
+	// Paths are normalized at startup
 	query1 := fmt.Sprintf(`
 		UPDATE %s
 		SET path = $1
-		WHERE user_name = $2 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $3
+		WHERE user_name = $2 AND path = $3
 	`, f.opt.TableName)
 
 	_, err = f.db.ExecContext(ctx, query1, dstPath, userName, srcPath)
@@ -2367,12 +2378,13 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 
 	if rootPath == "" {
 		// List everything for this user
+		// Paths are normalized at startup
 		query = fmt.Sprintf(`
 			SELECT
 				media_key,
 				file_name,
-				COALESCE(name, '') as custom_name,
-				COALESCE(path, '') as custom_path,
+				name,
+				path,
 				COALESCE(type, 0) as item_type,
 				COALESCE(size_bytes, 0) as size_bytes,
 				COALESCE(utc_timestamp, 0) as utc_timestamp
@@ -2385,19 +2397,19 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 		rows, err = f.db.QueryContext(ctx, query, userName)
 	} else {
 		// List everything under rootPath (path = rootPath OR path starts with rootPath/)
+		// Paths are normalized at startup
 		query = fmt.Sprintf(`
 			SELECT
 				media_key,
 				file_name,
-				COALESCE(name, '') as custom_name,
-				COALESCE(path, '') as custom_path,
+				name,
+				path,
 				COALESCE(type, 0) as item_type,
 				COALESCE(size_bytes, 0) as size_bytes,
 				COALESCE(utc_timestamp, 0) as utc_timestamp
 			FROM %s
 			WHERE user_name = $1
-				AND (TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2
-				     OR COALESCE(path, '') LIKE $3)
+				AND (path = $2 OR path LIKE $3)
 				AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 				AND (is_canonical IS NULL OR is_canonical = true)
 			ORDER BY path, type ASC, file_name ASC

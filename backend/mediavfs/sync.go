@@ -130,9 +130,29 @@ func (f *Fs) InitializeDatabase(ctx context.Context) error {
 	return nil
 }
 
-// normalizePathsInDB strips leading/trailing slashes from all path values in the database
+// normalizePathsInDB normalizes all path values in the database:
+// - Converts NULL paths to empty string
+// - Strips leading/trailing slashes
+// This runs on every startup to ensure consistent data for simple queries.
 func (f *Fs) normalizePathsInDB(ctx context.Context) error {
-	// Update paths that have trailing slashes
+	// Convert NULL paths to empty string
+	queryNull := fmt.Sprintf(`
+		UPDATE %s
+		SET path = ''
+		WHERE path IS NULL
+	`, f.opt.TableName)
+
+	resultNull, err := f.db.ExecContext(ctx, queryNull)
+	if err != nil {
+		return fmt.Errorf("failed to normalize NULL paths: %w", err)
+	}
+
+	rowsNull, _ := resultNull.RowsAffected()
+	if rowsNull > 0 {
+		fs.Debugf(f, "Normalized %d NULL paths to empty string", rowsNull)
+	}
+
+	// Update paths that have leading/trailing slashes
 	query := fmt.Sprintf(`
 		UPDATE %s
 		SET path = TRIM(BOTH '/' FROM path)
@@ -149,7 +169,14 @@ func (f *Fs) normalizePathsInDB(ctx context.Context) error {
 		fs.Debugf(f, "Normalized %d paths by removing leading/trailing slashes", rowsAffected)
 	}
 
-	// Also normalize file_name column (strip slashes)
+	// Convert NULL file_name to empty string and strip slashes
+	queryFnNull := fmt.Sprintf(`
+		UPDATE %s
+		SET file_name = ''
+		WHERE file_name IS NULL
+	`, f.opt.TableName)
+	f.db.ExecContext(ctx, queryFnNull) // Ignore error
+
 	query2 := fmt.Sprintf(`
 		UPDATE %s
 		SET file_name = TRIM(BOTH '/' FROM file_name)
@@ -166,7 +193,14 @@ func (f *Fs) normalizePathsInDB(ctx context.Context) error {
 		fs.Debugf(f, "Normalized %d file_names by removing slashes", rowsAffected2)
 	}
 
-	// Also normalize name column (custom name, strip slashes)
+	// Convert NULL name to empty string and strip slashes
+	queryNameNull := fmt.Sprintf(`
+		UPDATE %s
+		SET name = ''
+		WHERE name IS NULL
+	`, f.opt.TableName)
+	f.db.ExecContext(ctx, queryNameNull) // Ignore error
+
 	query3 := fmt.Sprintf(`
 		UPDATE %s
 		SET name = TRIM(BOTH '/' FROM name)
