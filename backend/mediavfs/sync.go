@@ -126,11 +126,6 @@ func (f *Fs) InitializeDatabase(ctx context.Context) error {
 		fs.Errorf(f, "Failed to create unique index (duplicates may exist): %v", err)
 	}
 
-	// Normalize paths - strip trailing slashes from all paths
-	if err := f.normalizePathsInDB(ctx); err != nil {
-		fs.Errorf(f, "Failed to normalize paths (non-fatal): %v", err)
-	}
-
 	// Create missing folder rows for paths that have files but no folder entry
 	if err := f.createMissingFolders(ctx); err != nil {
 		fs.Errorf(f, "Failed to create missing folders (non-fatal): %v", err)
@@ -142,96 +137,6 @@ func (f *Fs) InitializeDatabase(ctx context.Context) error {
 	}
 
 	fs.Debugf(f, "Database schema initialized successfully")
-	return nil
-}
-
-// normalizePathsInDB normalizes all path values in the database:
-// - Converts NULL paths to empty string
-// - Strips leading/trailing slashes
-// This runs on every startup to ensure consistent data for simple queries.
-func (f *Fs) normalizePathsInDB(ctx context.Context) error {
-	// Convert NULL paths to empty string
-	queryNull := fmt.Sprintf(`
-		UPDATE %s
-		SET path = ''
-		WHERE path IS NULL
-	`, f.opt.TableName)
-
-	resultNull, err := f.db.ExecContext(ctx, queryNull)
-	if err != nil {
-		return fmt.Errorf("failed to normalize NULL paths: %w", err)
-	}
-
-	rowsNull, _ := resultNull.RowsAffected()
-	if rowsNull > 0 {
-		fs.Debugf(f, "Normalized %d NULL paths to empty string", rowsNull)
-	}
-
-	// Update paths that have leading/trailing slashes
-	query := fmt.Sprintf(`
-		UPDATE %s
-		SET path = TRIM(BOTH '/' FROM path)
-		WHERE path LIKE '%%/' OR path LIKE '/%%'
-	`, f.opt.TableName)
-
-	result, err := f.db.ExecContext(ctx, query)
-	if err != nil {
-		return fmt.Errorf("failed to normalize paths: %w", err)
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected > 0 {
-		fs.Debugf(f, "Normalized %d paths by removing leading/trailing slashes", rowsAffected)
-	}
-
-	// Convert NULL file_name to empty string and strip slashes
-	queryFnNull := fmt.Sprintf(`
-		UPDATE %s
-		SET file_name = ''
-		WHERE file_name IS NULL
-	`, f.opt.TableName)
-	f.db.ExecContext(ctx, queryFnNull) // Ignore error
-
-	query2 := fmt.Sprintf(`
-		UPDATE %s
-		SET file_name = TRIM(BOTH '/' FROM file_name)
-		WHERE file_name LIKE '%%/' OR file_name LIKE '/%%'
-	`, f.opt.TableName)
-
-	result2, err := f.db.ExecContext(ctx, query2)
-	if err != nil {
-		return fmt.Errorf("failed to normalize file_names: %w", err)
-	}
-
-	rowsAffected2, _ := result2.RowsAffected()
-	if rowsAffected2 > 0 {
-		fs.Debugf(f, "Normalized %d file_names by removing slashes", rowsAffected2)
-	}
-
-	// Convert NULL name to empty string and strip slashes
-	queryNameNull := fmt.Sprintf(`
-		UPDATE %s
-		SET name = ''
-		WHERE name IS NULL
-	`, f.opt.TableName)
-	f.db.ExecContext(ctx, queryNameNull) // Ignore error
-
-	query3 := fmt.Sprintf(`
-		UPDATE %s
-		SET name = TRIM(BOTH '/' FROM name)
-		WHERE name LIKE '%%/' OR name LIKE '/%%'
-	`, f.opt.TableName)
-
-	result3, err := f.db.ExecContext(ctx, query3)
-	if err != nil {
-		return fmt.Errorf("failed to normalize names: %w", err)
-	}
-
-	rowsAffected3, _ := result3.RowsAffected()
-	if rowsAffected3 > 0 {
-		fs.Debugf(f, "Normalized %d names by removing slashes", rowsAffected3)
-	}
-
 	return nil
 }
 
