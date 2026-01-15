@@ -398,6 +398,7 @@ func (f *Fs) InsertMediaItems(ctx context.Context, items []gphoto.MediaItem) err
 			content_version = EXCLUDED.content_version,
 			-- Do NOT update utc_timestamp for existing files to keep modtime stable
 			-- This prevents stashapp from detecting "file changed" on VFS remount
+			-- Hide non-canonical files (exact copies) - trash_timestamp already computed in Go
 			trash_timestamp = EXCLUDED.trash_timestamp,
 			is_archived = EXCLUDED.is_archived,
 			is_favorite = EXCLUDED.is_favorite
@@ -410,12 +411,19 @@ func (f *Fs) InsertMediaItems(ctx context.Context, items []gphoto.MediaItem) err
 	defer stmt.Close()
 
 	for _, item := range items {
+		// Hide non-canonical files (exact copies) by setting trash_timestamp = -1
+		// This keeps them in the database but hides from listings
+		trashTimestamp := item.TrashTimestamp
+		if !item.IsCanonical && (item.TrashTimestamp == 0) {
+			trashTimestamp = -1
+		}
+
 		_, err = stmt.ExecContext(ctx,
 			item.MediaKey, item.FileName, item.DedupKey, item.IsCanonical, item.Type,
 			item.Caption, item.CollectionID, item.SizeBytes, item.QuotaChargedBytes,
 			item.Origin, item.ContentVersion, item.UTCTimestamp, item.ServerCreationTimestamp,
 			item.TimezoneOffset, item.Width, item.Height, item.RemoteURL, item.UploadStatus,
-			item.TrashTimestamp, item.IsArchived, item.IsFavorite, item.IsLocked,
+			trashTimestamp, item.IsArchived, item.IsFavorite, item.IsLocked,
 			item.IsOriginalQuality, item.Latitude, item.Longitude, item.LocationName,
 			item.LocationID, item.IsEdited, item.Make, item.Model, item.Aperture,
 			item.ShutterSpeed, item.ISO, item.FocalLength, item.Duration,
