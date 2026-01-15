@@ -1654,6 +1654,18 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	// Add to destination directory cache
 	f.addToDirCache(newPath, newObj)
 
+	// Update lazyMeta cache - remove old path and add new path
+	f.lazyMu.Lock()
+	delete(f.lazyMeta, srcObj.remote)
+	f.lazyMeta[remote] = newObj
+	f.lazyMu.Unlock()
+
+	// Invalidate prefetched dirs for both source and destination
+	f.prefetchMu.Lock()
+	delete(f.prefetchedDirs, srcObj.displayPath)
+	delete(f.prefetchedDirs, newPath)
+	f.prefetchMu.Unlock()
+
 	fs.Debugf(nil, "Move completed: %s -> %s", srcObj.remote, remote)
 
 	return newObj, nil
@@ -1770,6 +1782,25 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	// Also invalidate caches for the source and destination directories themselves
 	f.invalidateDirCache(srcPath)
 	f.invalidateDirCache(dstPath)
+
+	// Clear lazyMeta entries for all files in moved directory
+	f.lazyMu.Lock()
+	for key := range f.lazyMeta {
+		if key == srcPath || strings.HasPrefix(key, srcPath+"/") {
+			delete(f.lazyMeta, key)
+		}
+	}
+	f.lazyMu.Unlock()
+
+	// Clear prefetchedDirs for source and destination paths
+	f.prefetchMu.Lock()
+	for key := range f.prefetchedDirs {
+		if key == srcPath || strings.HasPrefix(key, srcPath+"/") ||
+			key == dstPath || strings.HasPrefix(key, dstPath+"/") {
+			delete(f.prefetchedDirs, key)
+		}
+	}
+	f.prefetchMu.Unlock()
 
 	// Update folderExistsCache - remove old path, add new path
 	f.folderCacheMu.Lock()
