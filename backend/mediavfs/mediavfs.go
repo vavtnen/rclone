@@ -649,9 +649,9 @@ func (f *Fs) listUserFiles(ctx context.Context, userName string, dirPath string)
 		SELECT * FROM (
 			SELECT DISTINCT ON (user_name, path, COALESCE(NULLIF(name, ''), file_name))
 				media_key,
-				file_name,
-				name,
-				path,
+				COALESCE(file_name, '') as file_name,
+				COALESCE(name, '') as name,
+				COALESCE(path, '') as path,
 				COALESCE(type, 0) as item_type,
 				COALESCE(size_bytes, 0) as size_bytes,
 				COALESCE(utc_timestamp, 0) as utc_timestamp
@@ -809,8 +809,8 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	folderQuery := fmt.Sprintf(`
 		SELECT type FROM %s
 		WHERE user_name = $1
-			AND CASE WHEN path = '' THEN COALESCE(NULLIF(name, ''), file_name)
-			         ELSE path || '/' || COALESCE(NULLIF(name, ''), file_name) END = $2
+			AND CASE WHEN COALESCE(path, '') = '' THEN COALESCE(NULLIF(name, ''), file_name)
+			         ELSE COALESCE(path, '') || '/' || COALESCE(NULLIF(name, ''), file_name) END = $2
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 		ORDER BY utc_timestamp DESC
 		LIMIT 1
@@ -835,16 +835,16 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	query := fmt.Sprintf(`
 		SELECT
 			media_key,
-			file_name,
-			name,
-			path,
+			COALESCE(file_name, '') as file_name,
+			COALESCE(name, '') as name,
+			COALESCE(path, '') as path,
 			COALESCE(size_bytes, 0) as size_bytes,
 			COALESCE(utc_timestamp, 0) as utc_timestamp
 		FROM %s
 		WHERE user_name = $1
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-			AND CASE WHEN path = '' THEN COALESCE(NULLIF(name, ''), file_name)
-			         ELSE path || '/' || COALESCE(NULLIF(name, ''), file_name) END = $2
+			AND CASE WHEN COALESCE(path, '') = '' THEN COALESCE(NULLIF(name, ''), file_name)
+			         ELSE COALESCE(path, '') || '/' || COALESCE(NULLIF(name, ''), file_name) END = $2
 		ORDER BY utc_timestamp DESC
 		LIMIT 1
 	`, f.opt.TableName)
@@ -1128,7 +1128,7 @@ func (f *Fs) changeNotify(ctx context.Context, notify func(string, fs.EntryType)
 			// Query for rows newer than lastTimestamp
 			// Paths are normalized at startup
 			query := fmt.Sprintf(`
-				SELECT media_key, file_name, name, path, COALESCE(size_bytes, 0) as size_bytes, COALESCE(utc_timestamp, 0) as utc_timestamp
+				SELECT media_key, COALESCE(file_name, '') as file_name, COALESCE(name, '') as name, COALESCE(path, '') as path, COALESCE(size_bytes, 0) as size_bytes, COALESCE(utc_timestamp, 0) as utc_timestamp
 				FROM %s
 				WHERE user_name = $1 AND utc_timestamp > $2
 				ORDER BY utc_timestamp
@@ -2307,9 +2307,9 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 			SELECT * FROM (
 				SELECT DISTINCT ON (user_name, path, COALESCE(NULLIF(name, ''), file_name))
 					media_key,
-					file_name,
-					name,
-					path,
+					COALESCE(file_name, '') as file_name,
+					COALESCE(name, '') as name,
+					COALESCE(path, '') as path,
 					COALESCE(type, 0) as item_type,
 					COALESCE(size_bytes, 0) as size_bytes,
 					COALESCE(utc_timestamp, 0) as utc_timestamp
@@ -2329,15 +2329,15 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 			SELECT * FROM (
 				SELECT DISTINCT ON (user_name, path, COALESCE(NULLIF(name, ''), file_name))
 					media_key,
-					file_name,
-					name,
-					path,
+					COALESCE(file_name, '') as file_name,
+					COALESCE(name, '') as name,
+					COALESCE(path, '') as path,
 					COALESCE(type, 0) as item_type,
 					COALESCE(size_bytes, 0) as size_bytes,
 					COALESCE(utc_timestamp, 0) as utc_timestamp
 				FROM %s
 				WHERE user_name = $1
-					AND (path = $2 OR path LIKE $3)
+					AND (COALESCE(path, '') = $2 OR COALESCE(path, '') LIKE $3)
 					AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 				ORDER BY user_name, path, COALESCE(NULLIF(name, ''), file_name), utc_timestamp DESC
 			) sub
