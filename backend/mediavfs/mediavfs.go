@@ -1879,9 +1879,9 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 		if err != nil {
 			if errors.Is(err, gphoto.ErrMediaNotFound) {
 				fs.Errorf(o, "File not found in Google Photos: %s - marking as missing (trash_timestamp=-2)", o.remote)
-				// Set trash_timestamp = -2 to mark as missing/404 (user can see which files need re-upload)
-				// This hides the file from listings but keeps the record for user reference
-				updateQuery := fmt.Sprintf(`UPDATE %s SET trash_timestamp = -2 WHERE media_key = $1`, o.fs.opt.TableName)
+				// Set trash_timestamp = -2 and path = NULL to mark as missing/404
+				// path = NULL prevents duplicates if user uploads new file with same name and old file comes back
+				updateQuery := fmt.Sprintf(`UPDATE %s SET trash_timestamp = -2, path = NULL WHERE media_key = $1`, o.fs.opt.TableName)
 				_, updateErr := o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
 				if updateErr != nil {
 					fs.Errorf(o, "Failed to mark missing media in database: %v", updateErr)
@@ -1942,9 +1942,9 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 				if headResp.StatusCode == http.StatusNotFound {
 					fs.Errorf(o, "File not found (404) during URL resolution for %s - marking as missing (trash_timestamp=-2)", o.remote)
 					headResp.Body.Close()
-					// Set trash_timestamp = -2 to mark as missing/404 (user can see which files need re-upload)
-					// This hides the file from listings but keeps the record for user reference
-					updateQuery := fmt.Sprintf(`UPDATE %s SET trash_timestamp = -2 WHERE media_key = $1`, o.fs.opt.TableName)
+					// Set trash_timestamp = -2 and path = NULL to mark as missing/404
+					// path = NULL prevents duplicates if user uploads new file with same name and old file comes back
+					updateQuery := fmt.Sprintf(`UPDATE %s SET trash_timestamp = -2, path = NULL WHERE media_key = $1`, o.fs.opt.TableName)
 					_, updateErr := o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
 					if updateErr != nil {
 						fs.Errorf(o, "Failed to mark missing media in database: %v", updateErr)
@@ -2012,11 +2012,18 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	fileSize := meta.size
 
 	// Check if this is a range/seek request (not initial download)
+	// A range starting at 0 is still considered an initial download
 	isRangeRequest := false
 	for _, opt := range options {
-		switch opt.(type) {
-		case *fs.RangeOption, *fs.SeekOption:
-			isRangeRequest = true
+		switch x := opt.(type) {
+		case *fs.RangeOption:
+			if x.Start > 0 {
+				isRangeRequest = true
+			}
+		case *fs.SeekOption:
+			if x.Offset > 0 {
+				isRangeRequest = true
+			}
 		}
 	}
 
@@ -2148,29 +2155,26 @@ func (o *Object) Remove(ctx context.Context) error {
 
 	fs.Debugf(o.fs, "Checking duplicates before removing %s", o.Remote())
 
-	// Get the dedup_key for this file
+	// Get dedup_key and count duplicates in a single query for better performance
 	var dedupKey string
-	dedupQuery := fmt.Sprintf(`SELECT COALESCE(dedup_key, '') FROM %s WHERE media_key = $1`, o.fs.opt.TableName)
-	err := o.fs.db.QueryRowContext(ctx, dedupQuery, o.mediaKey).Scan(&dedupKey)
-	if err != nil {
-		return fmt.Errorf("failed to get dedup_key: %w", err)
-	}
-
-	// Count how many files share this dedup_key (excluding already trashed files)
 	var duplicateCount int
-	if dedupKey != "" {
-		countQuery := fmt.Sprintf(`
-			SELECT COUNT(*) FROM %s
-			WHERE dedup_key = $1
-			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-		`, o.fs.opt.TableName)
-		err = o.fs.db.QueryRowContext(ctx, countQuery, dedupKey).Scan(&duplicateCount)
-		if err != nil {
-			return fmt.Errorf("failed to count duplicates: %w", err)
-		}
-	} else {
-		// No dedup_key means we can't check for duplicates, treat as unique
-		duplicateCount = 1
+	query := fmt.Sprintf(`
+		SELECT
+			COALESCE(m.dedup_key, '') as dedup_key,
+			CASE
+				WHEN m.dedup_key IS NULL OR m.dedup_key = '' THEN 1
+				ELSE (
+					SELECT COUNT(*) FROM %s
+					WHERE dedup_key = m.dedup_key
+					AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+				)
+			END as duplicate_count
+		FROM %s m
+		WHERE m.media_key = $1
+	`, o.fs.opt.TableName, o.fs.opt.TableName)
+	err := o.fs.db.QueryRowContext(ctx, query, o.mediaKey).Scan(&dedupKey, &duplicateCount)
+	if err != nil {
+		return fmt.Errorf("failed to get dedup_key and count duplicates: %w", err)
 	}
 
 	// Remove from caches first
