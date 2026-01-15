@@ -641,25 +641,26 @@ func (f *Fs) listUserFiles(ctx context.Context, userName string, dirPath string)
 	// Normalize dirPath for comparison
 	dirPath = strings.Trim(dirPath, "/")
 
-	// Simple query: get all items where path = dirPath
-	// Folders have type = -1, files have type >= 0
-	// Exclude trashed items (trash_timestamp > 0)
-	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
+	// Query using DISTINCT ON to deduplicate files with same display name
+	// Inner query: picks one row per display name (newest by utc_timestamp)
+	// Outer query: orders results for display (folders first, then by name)
 	// Paths are normalized at startup so we can use direct comparison
 	query := fmt.Sprintf(`
-		SELECT
-			media_key,
-			file_name,
-			name,
-			path,
-			COALESCE(type, 0) as item_type,
-			COALESCE(size_bytes, 0) as size_bytes,
-			COALESCE(utc_timestamp, 0) as utc_timestamp
-		FROM %s
-		WHERE user_name = $1 AND path = $2
-			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-			AND (is_canonical IS NULL OR is_canonical = true)
-		ORDER BY type ASC, file_name ASC
+		SELECT * FROM (
+			SELECT DISTINCT ON (user_name, path, COALESCE(NULLIF(name, ''), file_name))
+				media_key,
+				file_name,
+				name,
+				path,
+				COALESCE(type, 0) as item_type,
+				COALESCE(size_bytes, 0) as size_bytes,
+				COALESCE(utc_timestamp, 0) as utc_timestamp
+			FROM %s
+			WHERE user_name = $1 AND path = $2
+				AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+			ORDER BY user_name, path, COALESCE(NULLIF(name, ''), file_name), utc_timestamp DESC
+		) sub
+		ORDER BY item_type ASC, file_name ASC
 	`, f.opt.TableName)
 
 	rows, err := f.db.QueryContext(ctx, query, userName, dirPath)
@@ -803,7 +804,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 
 	// Directory was prefetched but file not found - check if it's a folder
 	// This is a single query for the specific file/folder
-	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
+	// ORDER BY utc_timestamp DESC picks newest if duplicates exist (before unique constraint)
 	// Paths are normalized at startup, construct full path with CASE for root level
 	folderQuery := fmt.Sprintf(`
 		SELECT type FROM %s
@@ -811,7 +812,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 			AND CASE WHEN path = '' THEN COALESCE(NULLIF(name, ''), file_name)
 			         ELSE path || '/' || COALESCE(NULLIF(name, ''), file_name) END = $2
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-			AND (is_canonical IS NULL OR is_canonical = true)
+		ORDER BY utc_timestamp DESC
 		LIMIT 1
 	`, f.opt.TableName)
 
@@ -829,7 +830,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 
 	// Fallback: file exists but wasn't in cache (shouldn't normally happen)
-	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
+	// ORDER BY utc_timestamp DESC picks newest if duplicates exist (before unique constraint)
 	// Paths are normalized at startup
 	query := fmt.Sprintf(`
 		SELECT
@@ -842,9 +843,9 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		FROM %s
 		WHERE user_name = $1
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-			AND (is_canonical IS NULL OR is_canonical = true)
 			AND CASE WHEN path = '' THEN COALESCE(NULLIF(name, ''), file_name)
 			         ELSE path || '/' || COALESCE(NULLIF(name, ''), file_name) END = $2
+		ORDER BY utc_timestamp DESC
 		LIMIT 1
 	`, f.opt.TableName)
 
@@ -2293,48 +2294,54 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 	// Query ALL files and folders recursively under rootPath
 	// Files have path starting with rootPath (or equal to rootPath)
 	// This is a single query that gets everything
-	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
+	// Uses DISTINCT ON to deduplicate files with same display name in same path
 	var query string
 	var rows *sql.Rows
 	var err error
 
 	if rootPath == "" {
 		// List everything for this user
-		// Paths are normalized at startup
+		// Inner query: DISTINCT ON picks newest file per (path, display_name)
+		// Outer query: orders for display
 		query = fmt.Sprintf(`
-			SELECT
-				media_key,
-				file_name,
-				name,
-				path,
-				COALESCE(type, 0) as item_type,
-				COALESCE(size_bytes, 0) as size_bytes,
-				COALESCE(utc_timestamp, 0) as utc_timestamp
-			FROM %s
-			WHERE user_name = $1
-				AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-				AND (is_canonical IS NULL OR is_canonical = true)
-			ORDER BY path, type ASC, file_name ASC
+			SELECT * FROM (
+				SELECT DISTINCT ON (user_name, path, COALESCE(NULLIF(name, ''), file_name))
+					media_key,
+					file_name,
+					name,
+					path,
+					COALESCE(type, 0) as item_type,
+					COALESCE(size_bytes, 0) as size_bytes,
+					COALESCE(utc_timestamp, 0) as utc_timestamp
+				FROM %s
+				WHERE user_name = $1
+					AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+				ORDER BY user_name, path, COALESCE(NULLIF(name, ''), file_name), utc_timestamp DESC
+			) sub
+			ORDER BY path, item_type ASC, file_name ASC
 		`, f.opt.TableName)
 		rows, err = f.db.QueryContext(ctx, query, userName)
 	} else {
 		// List everything under rootPath (path = rootPath OR path starts with rootPath/)
-		// Paths are normalized at startup
+		// Inner query: DISTINCT ON picks newest file per (path, display_name)
+		// Outer query: orders for display
 		query = fmt.Sprintf(`
-			SELECT
-				media_key,
-				file_name,
-				name,
-				path,
-				COALESCE(type, 0) as item_type,
-				COALESCE(size_bytes, 0) as size_bytes,
-				COALESCE(utc_timestamp, 0) as utc_timestamp
-			FROM %s
-			WHERE user_name = $1
-				AND (path = $2 OR path LIKE $3)
-				AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-				AND (is_canonical IS NULL OR is_canonical = true)
-			ORDER BY path, type ASC, file_name ASC
+			SELECT * FROM (
+				SELECT DISTINCT ON (user_name, path, COALESCE(NULLIF(name, ''), file_name))
+					media_key,
+					file_name,
+					name,
+					path,
+					COALESCE(type, 0) as item_type,
+					COALESCE(size_bytes, 0) as size_bytes,
+					COALESCE(utc_timestamp, 0) as utc_timestamp
+				FROM %s
+				WHERE user_name = $1
+					AND (path = $2 OR path LIKE $3)
+					AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+				ORDER BY user_name, path, COALESCE(NULLIF(name, ''), file_name), utc_timestamp DESC
+			) sub
+			ORDER BY path, item_type ASC, file_name ASC
 		`, f.opt.TableName)
 		rows, err = f.db.QueryContext(ctx, query, userName, rootPath, rootPath+"/%")
 	}

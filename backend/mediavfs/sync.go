@@ -111,6 +111,21 @@ func (f *Fs) InitializeDatabase(ctx context.Context) error {
 		return fmt.Errorf("failed to create path indices: %w", err)
 	}
 
+	// Add UNIQUE constraint to prevent duplicate files in same path
+	// Uses COALESCE(NULLIF(name, ''), file_name) as display name
+	// Only applies to non-trashed items (partial unique index)
+	uniqueIndexQuery := fmt.Sprintf(`
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_unique_path_name
+		ON %s(user_name, path, COALESCE(NULLIF(name, ''), file_name))
+		WHERE (trash_timestamp IS NULL OR trash_timestamp = 0);
+	`, f.opt.TableName, f.opt.TableName)
+
+	_, err = f.db.ExecContext(ctx, uniqueIndexQuery)
+	if err != nil {
+		// Non-fatal - might fail if duplicates already exist
+		fs.Errorf(f, "Failed to create unique index (duplicates may exist): %v", err)
+	}
+
 	// Normalize paths - strip trailing slashes from all paths
 	if err := f.normalizePathsInDB(ctx); err != nil {
 		fs.Errorf(f, "Failed to normalize paths (non-fatal): %v", err)
