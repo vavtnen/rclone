@@ -25,6 +25,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/cache"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -251,28 +252,24 @@ type Options struct {
 
 // Fs represents a connection to the media database
 type Fs struct {
-	name        string
-	root        string
-	opt         Options
-	features    *fs.Features
-	db          *sql.DB
-	dbConnStr   string // stored for lazy notify listener start
-	httpClient  *http.Client
-	api         *gphoto.API // Google Photos API client for download URLs
-	urlCache    *urlCache
+	name          string
+	root          string
+	opt           Options
+	features      *fs.Features
+	db            *sql.DB
+	dbConnStr     string // stored for lazy notify listener start
+	httpClient    *http.Client
+	api           *gphoto.API // Google Photos API client for download URLs
+	urlCache      *urlCache
 	urlFetchGroup singleflight.Group // Coalesces duplicate URL fetch requests
-	// lazyMeta stores metadata loaded asynchronously for large listings
-	lazyMeta map[string]*Object
-	lazyMu   sync.RWMutex
-	// prefetchedDirs tracks which directories have been prefetched for NewObject
-	prefetchedDirs map[string]bool
-	prefetchMu     sync.RWMutex
+	// objectCache stores Object metadata for fast NewObject lookups (replaces lazyMeta)
+	objectCache *cache.Cache
+	// prefetchCache tracks which directories have been prefetched for NewObject
+	prefetchCache *cache.Cache
 	// dirCache caches directory listings to avoid reloading on every change
-	dirCache map[string]*dirCacheEntry
-	dirMu    sync.RWMutex
-	// folderExistsCache tracks folders we've already created/verified in this session
-	folderExistsCache map[string]bool
-	folderCacheMu     sync.RWMutex
+	dirCache *cache.Cache
+	// folderCache tracks folders we've already created/verified in this session
+	folderCache *cache.Cache
 	// syncStop channel to stop background sync goroutine
 	syncStop chan struct{}
 	// bgCtx is a context for background operations that can be cancelled on shutdown
@@ -285,12 +282,6 @@ type Fs struct {
 	// Put operations wait for this before uploading
 	mountReady     chan struct{}
 	mountReadyOnce sync.Once
-}
-
-// dirCacheEntry represents a cached directory listing
-type dirCacheEntry struct {
-	entries   fs.DirEntries
-	expiresAt time.Time
 }
 
 // Object represents a media file in the database
@@ -451,17 +442,17 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		root:              root,
 		opt:               *opt,
 		db:                db,
-		dbConnStr:         dbConnStr, // store for lazy notify listener start
-		httpClient:        customClient,
-		urlCache:          newURLCache(),
-		lazyMeta:          make(map[string]*Object),
-		prefetchedDirs:    make(map[string]bool),
-		dirCache:          make(map[string]*dirCacheEntry),
-		folderExistsCache: make(map[string]bool),
-		syncStop:          make(chan struct{}),
-		bgCtx:             bgCtx,
-		bgCancel:          bgCancel,
-		mountReady:        make(chan struct{}),
+		dbConnStr:     dbConnStr, // store for lazy notify listener start
+		httpClient:    customClient,
+		urlCache:      newURLCache(),
+		objectCache:   cache.New().SetExpireDuration(time.Hour),           // Object metadata cache (1 hour)
+		prefetchCache: cache.New().SetExpireDuration(5 * time.Minute),     // Prefetch tracking (5 min)
+		dirCache:      cache.New().SetExpireDuration(dirCacheTTL),         // Directory listings (5 min)
+		folderCache:   cache.New().SetExpireDuration(0),                   // Folder existence (never expires, session-only)
+		syncStop:      make(chan struct{}),
+		bgCtx:         bgCtx,
+		bgCancel:      bgCancel,
+		mountReady:    make(chan struct{}),
 	}
 
 	// Initialize Google Photos API client for download URLs
@@ -624,33 +615,21 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		cacheKey = "." // Use "." for root
 	}
 
-	f.dirMu.RLock()
-	if entry, ok := f.dirCache[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
-		f.dirMu.RUnlock()
-		fs.Debugf(f, "List cache hit for %s", dir)
-		return entry.entries, nil
-	}
-	f.dirMu.RUnlock()
-
-	// Cache miss or expired, load from database
-	// Use configured user for per-user mounts
-	var result fs.DirEntries
-	result, err = f.listUserFiles(ctx, f.opt.User, root)
-
+	// Use lib/cache Get with create function
+	value, err := f.dirCache.Get(cacheKey, func(key string) (any, bool, error) {
+		// Cache miss - load from database
+		result, err := f.listUserFiles(ctx, f.opt.User, root)
+		if err != nil {
+			return nil, false, err // Don't cache errors
+		}
+		fs.Debugf(f, "List cached %s with %d entries", dir, len(result))
+		return result, true, nil
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Cache the result with a long TTL (1 hour)
-	f.dirMu.Lock()
-	f.dirCache[cacheKey] = &dirCacheEntry{
-		entries:   result,
-		expiresAt: time.Now().Add(time.Hour),
-	}
-	f.dirMu.Unlock()
-
-	fs.Debugf(f, "List cached %s with %d entries", dir, len(result))
-	return result, nil
+	return value.(fs.DirEntries), nil
 }
 
 // listUsers is no longer needed - single user per database
@@ -759,19 +738,14 @@ func (f *Fs) listUserFiles(ctx context.Context, userName string, dirPath string)
 			}
 			entries = append(entries, obj)
 
-			// Store in lazyMeta cache so NewObject can find it without a DB query
-			f.lazyMu.Lock()
-			f.lazyMeta[remote] = obj
-			f.lazyMu.Unlock()
+			// Store in objectCache so NewObject can find it without a DB query
+			f.objectCache.Put(remote, obj)
 		}
 	}
 
 	if err = rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating files: %w", err)
 	}
-
-	// Note: lazyMeta is now populated directly in the loop above
-	// No need for background populateMetadata as it's redundant and causes high CPU
 
 	return entries, nil
 }
@@ -793,12 +767,9 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 
 	// Fast path: check if we've loaded metadata in cache
-	f.lazyMu.RLock()
-	if o, ok := f.lazyMeta[remote]; ok {
-		f.lazyMu.RUnlock()
-		return o, nil
+	if value, found := f.objectCache.GetMaybe(remote); found {
+		return value.(*Object), nil
 	}
-	f.lazyMu.RUnlock()
 
 	// Parse the path to get directory
 	var dirPath string
@@ -811,12 +782,10 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	// Check if we've already prefetched this directory
 	// The prefetch key is the full database path (not relative)
 	prefetchKey := dirPath
-	f.prefetchMu.RLock()
-	alreadyPrefetched := f.prefetchedDirs[prefetchKey]
-	f.prefetchMu.RUnlock()
+	_, alreadyPrefetched := f.prefetchCache.GetMaybe(prefetchKey)
 
 	if !alreadyPrefetched {
-		// Prefetch the entire directory - this populates lazyMeta for all files in the dir
+		// Prefetch the entire directory - this populates objectCache for all files in the dir
 		// This is much faster than individual queries when copying many files
 		_, err := f.listUserFiles(ctx, userName, dirPath)
 		if err != nil {
@@ -824,17 +793,12 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		}
 
 		// Mark directory as prefetched
-		f.prefetchMu.Lock()
-		f.prefetchedDirs[prefetchKey] = true
-		f.prefetchMu.Unlock()
+		f.prefetchCache.Put(prefetchKey, true)
 
-		// Check lazyMeta again after prefetch
-		f.lazyMu.RLock()
-		if o, ok := f.lazyMeta[remote]; ok {
-			f.lazyMu.RUnlock()
-			return o, nil
+		// Check objectCache again after prefetch
+		if value, found := f.objectCache.GetMaybe(remote); found {
+			return value.(*Object), nil
 		}
-		f.lazyMu.RUnlock()
 	}
 
 	// Directory was prefetched but file not found - check if it's a folder
@@ -921,9 +885,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 
 	// Cache for future lookups
-	f.lazyMu.Lock()
-	f.lazyMeta[remote] = obj
-	f.lazyMu.Unlock()
+	f.objectCache.Put(remote, obj)
 
 	return obj, nil
 }
@@ -934,10 +896,7 @@ func (f *Fs) invalidateDirCache(dirPath string) {
 	if cacheKey == "" {
 		cacheKey = "."
 	}
-
-	f.dirMu.Lock()
-	delete(f.dirCache, cacheKey)
-	f.dirMu.Unlock()
+	f.dirCache.Delete(cacheKey)
 }
 
 // removeFromDirCache removes a specific entry from a directory's cache
@@ -948,18 +907,19 @@ func (f *Fs) removeFromDirCache(dirPath string, entryName string) bool {
 		cacheKey = "."
 	}
 
-	f.dirMu.Lock()
-	defer f.dirMu.Unlock()
-
-	cached, exists := f.dirCache[cacheKey]
-	if !exists || len(cached.entries) == 0 {
+	value, found := f.dirCache.GetMaybe(cacheKey)
+	if !found {
+		return false
+	}
+	cached := value.(fs.DirEntries)
+	if len(cached) == 0 {
 		return false
 	}
 
 	// Find and remove the entry
-	newEntries := make(fs.DirEntries, 0, len(cached.entries))
-	found := false
-	for _, entry := range cached.entries {
+	newEntries := make(fs.DirEntries, 0, len(cached))
+	entryFound := false
+	for _, entry := range cached {
 		// Get the base name of the entry
 		baseName := entry.Remote()
 		if idx := strings.LastIndex(baseName, "/"); idx >= 0 {
@@ -968,17 +928,14 @@ func (f *Fs) removeFromDirCache(dirPath string, entryName string) bool {
 		if baseName != entryName {
 			newEntries = append(newEntries, entry)
 		} else {
-			found = true
+			entryFound = true
 		}
 	}
 
-	if found {
-		f.dirCache[cacheKey] = &dirCacheEntry{
-			entries:   newEntries,
-			expiresAt: cached.expiresAt,
-		}
+	if entryFound {
+		f.dirCache.Put(cacheKey, newEntries)
 	}
-	return found
+	return entryFound
 }
 
 // addToDirCache adds an entry to a directory's cache
@@ -989,19 +946,14 @@ func (f *Fs) addToDirCache(dirPath string, entry fs.DirEntry) {
 		cacheKey = "."
 	}
 
-	f.dirMu.Lock()
-	defer f.dirMu.Unlock()
-
-	cached, exists := f.dirCache[cacheKey]
-	if !exists {
+	value, found := f.dirCache.GetMaybe(cacheKey)
+	if !found {
 		return // Cache doesn't exist, will be populated on next list
 	}
+	cached := value.(fs.DirEntries)
 
 	// Add the entry to the cache
-	f.dirCache[cacheKey] = &dirCacheEntry{
-		entries:   append(cached.entries, entry),
-		expiresAt: cached.expiresAt,
-	}
+	f.dirCache.Put(cacheKey, append(cached, entry))
 }
 
 // ChangeNotify calls the passed function with a path that has had changes.
@@ -1389,12 +1341,9 @@ func (f *Fs) ensureFoldersExist(ctx context.Context, userName string, folderPath
 
 	// Check if this exact folder path is already cached
 	cacheKey := userName + ":" + folderPath
-	f.folderCacheMu.RLock()
-	if f.folderExistsCache[cacheKey] {
-		f.folderCacheMu.RUnlock()
+	if _, found := f.folderCache.GetMaybe(cacheKey); found {
 		return nil // Already verified/created
 	}
-	f.folderCacheMu.RUnlock()
 
 	parts := strings.Split(folderPath, "/")
 
@@ -1411,9 +1360,7 @@ func (f *Fs) ensureFoldersExist(ctx context.Context, userName string, folderPath
 
 		// Check cache for this specific folder level
 		levelCacheKey := userName + ":" + fullPath
-		f.folderCacheMu.RLock()
-		exists := f.folderExistsCache[levelCacheKey]
-		f.folderCacheMu.RUnlock()
+		_, exists := f.folderCache.GetMaybe(levelCacheKey)
 
 		if !exists {
 			mediaKey := fmt.Sprintf("folder:%s:%s", userName, fullPath)
@@ -1432,9 +1379,7 @@ func (f *Fs) ensureFoldersExist(ctx context.Context, userName string, folderPath
 			}
 
 			// Mark this folder as existing in cache
-			f.folderCacheMu.Lock()
-			f.folderExistsCache[levelCacheKey] = true
-			f.folderCacheMu.Unlock()
+			f.folderCache.Put(levelCacheKey, true)
 		}
 
 		// Update parentPath for next iteration
@@ -1594,11 +1539,9 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 	f.removeFromDirCache(parentPath, folderName)
 
-	// Remove from folderExistsCache
+	// Remove from folderCache
 	cacheKey := userName + ":" + folderPath
-	f.folderCacheMu.Lock()
-	delete(f.folderExistsCache, cacheKey)
-	f.folderCacheMu.Unlock()
+	f.folderCache.Delete(cacheKey)
 
 	fs.Debugf(f, "mediavfs: removed directory: %s", folderPath)
 	return nil
@@ -1665,17 +1608,13 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	// Add to destination directory cache
 	f.addToDirCache(newPath, newObj)
 
-	// Update lazyMeta cache - remove old path and add new path
-	f.lazyMu.Lock()
-	delete(f.lazyMeta, srcObj.remote)
-	f.lazyMeta[remote] = newObj
-	f.lazyMu.Unlock()
+	// Update objectCache - remove old path and add new path
+	f.objectCache.Delete(srcObj.remote)
+	f.objectCache.Put(remote, newObj)
 
 	// Invalidate prefetched dirs for both source and destination
-	f.prefetchMu.Lock()
-	delete(f.prefetchedDirs, srcObj.displayPath)
-	delete(f.prefetchedDirs, newPath)
-	f.prefetchMu.Unlock()
+	f.prefetchCache.Delete(srcObj.displayPath)
+	f.prefetchCache.Delete(newPath)
 
 	fs.Debugf(nil, "Move completed: %s -> %s", srcObj.remote, remote)
 
@@ -1794,30 +1733,19 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	f.invalidateDirCache(srcPath)
 	f.invalidateDirCache(dstPath)
 
-	// Clear lazyMeta entries for all files in moved directory
-	f.lazyMu.Lock()
-	for key := range f.lazyMeta {
-		if key == srcPath || strings.HasPrefix(key, srcPath+"/") {
-			delete(f.lazyMeta, key)
-		}
-	}
-	f.lazyMu.Unlock()
+	// Clear objectCache entries for all files in moved directory using DeletePrefix
+	f.objectCache.Delete(srcPath)
+	f.objectCache.DeletePrefix(srcPath + "/")
 
-	// Clear prefetchedDirs for source and destination paths
-	f.prefetchMu.Lock()
-	for key := range f.prefetchedDirs {
-		if key == srcPath || strings.HasPrefix(key, srcPath+"/") ||
-			key == dstPath || strings.HasPrefix(key, dstPath+"/") {
-			delete(f.prefetchedDirs, key)
-		}
-	}
-	f.prefetchMu.Unlock()
+	// Clear prefetchCache for source and destination paths using DeletePrefix
+	f.prefetchCache.Delete(srcPath)
+	f.prefetchCache.DeletePrefix(srcPath + "/")
+	f.prefetchCache.Delete(dstPath)
+	f.prefetchCache.DeletePrefix(dstPath + "/")
 
-	// Update folderExistsCache - remove old path, add new path
-	f.folderCacheMu.Lock()
-	delete(f.folderExistsCache, userName+":"+srcPath)
-	f.folderExistsCache[userName+":"+dstPath] = true
-	f.folderCacheMu.Unlock()
+	// Update folderCache - remove old path, add new path
+	f.folderCache.Delete(userName + ":" + srcPath)
+	f.folderCache.Put(userName+":"+dstPath, true)
 
 	fs.Debugf(nil, "DirMove completed: %s -> %s", srcRemote, dstRemote)
 	return nil
@@ -2224,9 +2152,7 @@ func (o *Object) Remove(ctx context.Context) error {
 		// File doesn't exist in database - this is a stale cache entry
 		fs.Errorf(o.fs, "CRITICAL: Remove called on stale cache entry %s (media_key=%s not found in database) - refusing to delete", o.Remote(), o.mediaKey)
 		// Clear the stale cache entry
-		o.fs.lazyMu.Lock()
-		delete(o.fs.lazyMeta, o.remote)
-		o.fs.lazyMu.Unlock()
+		o.fs.objectCache.Delete(o.remote)
 		o.fs.removeFromDirCache(o.displayPath, o.displayName)
 		return fs.ErrorObjectNotFound
 	}
@@ -2240,18 +2166,14 @@ func (o *Object) Remove(ctx context.Context) error {
 	if expectedPath != actualPath {
 		fs.Errorf(o.fs, "CRITICAL: Remove path mismatch - cache has %s but database has %s (media_key=%s) - refusing to delete to prevent data loss", expectedPath, actualPath, o.mediaKey)
 		// Clear the stale cache entry
-		o.fs.lazyMu.Lock()
-		delete(o.fs.lazyMeta, o.remote)
-		o.fs.lazyMu.Unlock()
+		o.fs.objectCache.Delete(o.remote)
 		o.fs.removeFromDirCache(o.displayPath, o.displayName)
 		return fs.ErrorObjectNotFound
 	}
 
 	// Remove from caches
 	o.fs.removeFromDirCache(o.displayPath, o.displayName)
-	o.fs.lazyMu.Lock()
-	delete(o.fs.lazyMeta, o.remote)
-	o.fs.lazyMu.Unlock()
+	o.fs.objectCache.Delete(o.remote)
 
 	if duplicateCount <= 1 {
 		// This is the only copy - safe to delete from Google Photos
@@ -2508,10 +2430,8 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 			}
 			entries = append(entries, obj)
 
-			// Store in lazyMeta cache for fast NewObject lookups
-			f.lazyMu.Lock()
-			f.lazyMeta[remote] = obj
-			f.lazyMu.Unlock()
+			// Store in objectCache for fast NewObject lookups
+			f.objectCache.Put(remote, obj)
 		}
 
 		// Send batch to callback when we reach batchSize
