@@ -2186,11 +2186,15 @@ func (o *Object) Remove(ctx context.Context) error {
 
 	fs.Debugf(o.fs, "Checking duplicates before removing %s", o.Remote())
 
-	// Get dedup_key and count duplicates in a single query for better performance
-	var dedupKey string
+	// CRITICAL: Get file info and verify it exists at the expected path in the database
+	// This prevents data loss from stale cache entries (e.g., after Move)
+	// Combined query for better performance: gets path, name, dedup_key, and duplicate count
+	var dbPath, dbName, dedupKey string
 	var duplicateCount int
 	query := fmt.Sprintf(`
 		SELECT
+			COALESCE(m.path, '') as path,
+			COALESCE(NULLIF(m.name, ''), m.file_name) as name,
 			COALESCE(m.dedup_key, '') as dedup_key,
 			CASE
 				WHEN m.dedup_key IS NULL OR m.dedup_key = '' THEN 1
@@ -2202,13 +2206,37 @@ func (o *Object) Remove(ctx context.Context) error {
 			END as duplicate_count
 		FROM %s m
 		WHERE m.media_key = $1
+		AND (m.trash_timestamp IS NULL OR m.trash_timestamp = 0)
 	`, o.fs.opt.TableName, o.fs.opt.TableName)
-	err := o.fs.db.QueryRowContext(ctx, query, o.mediaKey).Scan(&dedupKey, &duplicateCount)
+	err := o.fs.db.QueryRowContext(ctx, query, o.mediaKey).Scan(&dbPath, &dbName, &dedupKey, &duplicateCount)
+	if err == sql.ErrNoRows {
+		// File doesn't exist in database - this is a stale cache entry
+		fs.Errorf(o.fs, "CRITICAL: Remove called on stale cache entry %s (media_key=%s not found in database) - refusing to delete", o.Remote(), o.mediaKey)
+		// Clear the stale cache entry
+		o.fs.lazyMu.Lock()
+		delete(o.fs.lazyMeta, o.remote)
+		o.fs.lazyMu.Unlock()
+		o.fs.removeFromDirCache(o.displayPath, o.displayName)
+		return fs.ErrorObjectNotFound
+	}
 	if err != nil {
-		return fmt.Errorf("failed to get dedup_key and count duplicates: %w", err)
+		return fmt.Errorf("failed to get file info: %w", err)
 	}
 
-	// Remove from caches first
+	// Verify the path matches what we expect
+	expectedPath := strings.Trim(o.displayPath+"/"+o.displayName, "/")
+	actualPath := strings.Trim(dbPath+"/"+dbName, "/")
+	if expectedPath != actualPath {
+		fs.Errorf(o.fs, "CRITICAL: Remove path mismatch - cache has %s but database has %s (media_key=%s) - refusing to delete to prevent data loss", expectedPath, actualPath, o.mediaKey)
+		// Clear the stale cache entry
+		o.fs.lazyMu.Lock()
+		delete(o.fs.lazyMeta, o.remote)
+		o.fs.lazyMu.Unlock()
+		o.fs.removeFromDirCache(o.displayPath, o.displayName)
+		return fs.ErrorObjectNotFound
+	}
+
+	// Remove from caches
 	o.fs.removeFromDirCache(o.displayPath, o.displayName)
 	o.fs.lazyMu.Lock()
 	delete(o.fs.lazyMeta, o.remote)
@@ -2241,12 +2269,12 @@ func (o *Object) Remove(ctx context.Context) error {
 		// Mark for local deletion by setting trash_timestamp = -1 and path = NULL
 		// Setting path = NULL ensures the file doesn't appear in parent directory listings,
 		// allowing parent folders to be removed without "folder not empty" errors
-		query := fmt.Sprintf(`
+		updateQuery := fmt.Sprintf(`
 			UPDATE %s SET trash_timestamp = -1, path = NULL
 			WHERE media_key = $1
 		`, o.fs.opt.TableName)
 
-		_, err = o.fs.db.ExecContext(ctx, query, o.mediaKey)
+		_, err = o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
 		if err != nil {
 			return fmt.Errorf("failed to mark for deletion: %w", err)
 		}
