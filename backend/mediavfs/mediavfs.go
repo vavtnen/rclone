@@ -2181,21 +2181,28 @@ func (o *Object) Remove(ctx context.Context) error {
 		fs.Debugf(o.fs, "File %s is unique (no duplicates), deleting from Google Photos", o.Remote())
 
 		if dedupKey != "" {
-			// Delete from Google Photos
+			// Delete from Google Photos (moves to trash first, then permanent after 60 days)
 			if err := o.fs.DeleteFromGPhotos(ctx, []string{dedupKey}, o.userName); err != nil {
 				fs.Errorf(o.fs, "Failed to delete from Google Photos: %v", err)
 				// Still mark as deleted locally even if Google delete fails
 			}
 		}
 
-		// Delete from database
-		deleteQuery := fmt.Sprintf(`DELETE FROM %s WHERE media_key = $1`, o.fs.opt.TableName)
-		_, err = o.fs.db.ExecContext(ctx, deleteQuery, o.mediaKey)
+		// Mark as trashed locally instead of deleting from DB
+		// Google will update with real trash_timestamp during sync
+		// When user permanently deletes from Google trash, sync will remove from DB
+		// path = NULL prevents duplicates if user uploads new file with same name and old file comes back
+		updateQuery := fmt.Sprintf(`
+			UPDATE %s SET trash_timestamp = -1, path = NULL
+			WHERE media_key = $1
+		`, o.fs.opt.TableName)
+
+		_, err = o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
 		if err != nil {
-			return fmt.Errorf("failed to delete from database: %w", err)
+			return fmt.Errorf("failed to mark for deletion: %w", err)
 		}
 
-		fs.Infof(o.fs, "Deleted %s from Google Photos and database", o.Remote())
+		fs.Infof(o.fs, "Deleted %s from Google Photos (moved to trash)", o.Remote())
 	} else {
 		// Multiple copies exist - only hide locally to prevent data loss
 		fs.Debugf(o.fs, "File %s has %d copies, hiding locally only (not deleting from Google Photos)", o.Remote(), duplicateCount)
@@ -2203,6 +2210,7 @@ func (o *Object) Remove(ctx context.Context) error {
 		// Mark for local deletion by setting trash_timestamp = -1 and path = NULL
 		// Setting path = NULL ensures the file doesn't appear in parent directory listings,
 		// allowing parent folders to be removed without "folder not empty" errors
+		// path = NULL prevents duplicates if user uploads new file with same name and old file comes back
 		updateQuery := fmt.Sprintf(`
 			UPDATE %s SET trash_timestamp = -1, path = NULL
 			WHERE media_key = $1
