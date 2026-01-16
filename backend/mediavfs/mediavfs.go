@@ -1732,8 +1732,6 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return fs.ErrorCantDirMove
 	}
 
-	// In single-user mode, use f.opt.User as the username
-	// The remote paths are just the directory paths without username prefix
 	userName := f.opt.User
 	srcPath := strings.Trim(srcRemote, "/")
 	dstPath := strings.Trim(dstRemote, "/")
@@ -1744,7 +1742,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 
 	fs.Debugf(nil, "DirMove: %s -> %s", srcPath, dstPath)
 
-	// Ensure destination parent folders exist
+	// Ensure destination parent folders exist (single CTE query)
 	if strings.Contains(dstPath, "/") {
 		parentPath := dstPath[:strings.LastIndex(dstPath, "/")]
 		if err := f.ensureFoldersExist(ctx, userName, parentPath); err != nil {
@@ -1752,76 +1750,57 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		}
 	}
 
-	// Get the new folder name (last component of dstPath)
+	// Get destination folder name and parent path
 	dstFolderName := dstPath
-	if strings.Contains(dstPath, "/") {
-		dstFolderName = dstPath[strings.LastIndex(dstPath, "/")+1:]
-	}
-
-	// Get the new parent path (for the folder row)
 	dstParentPath := ""
 	if strings.Contains(dstPath, "/") {
+		dstFolderName = dstPath[strings.LastIndex(dstPath, "/")+1:]
 		dstParentPath = dstPath[:strings.LastIndex(dstPath, "/")]
 	}
 
-	// Update the source folder row itself
-	srcMediaKey := fmt.Sprintf("folder:%s:%s", userName, srcPath)
-	dstMediaKey := fmt.Sprintf("folder:%s:%s", userName, dstPath)
+	// Single query to do all updates in one round-trip using DO block
+	// This combines: delete existing, update folder, update files, update subfolders
+	query := fmt.Sprintf(`
+		DO $$
+		DECLARE
+			src_path TEXT := '%s';
+			dst_path TEXT := '%s';
+			dst_name TEXT := '%s';
+			dst_parent TEXT := '%s';
+			uname TEXT := '%s';
+			src_key TEXT;
+			dst_key TEXT;
+		BEGIN
+			src_key := 'folder:' || uname || ':' || src_path;
+			dst_key := 'folder:' || uname || ':' || dst_path;
 
-	// Delete any existing folder at destination (in case of overwrite)
-	deleteQuery := fmt.Sprintf(`DELETE FROM %s WHERE media_key = $1`, f.opt.TableName)
-	_, _ = f.db.ExecContext(ctx, deleteQuery, dstMediaKey)
+			-- Delete existing folder at destination
+			DELETE FROM %s WHERE media_key = dst_key;
 
-	// Update source folder to destination
-	updateFolderQuery := fmt.Sprintf(`
-		UPDATE %s
-		SET media_key = $1, file_name = $2, path = $3
-		WHERE media_key = $4
-	`, f.opt.TableName)
+			-- Update source folder row
+			UPDATE %s SET media_key = dst_key, file_name = dst_name, path = dst_parent
+			WHERE media_key = src_key;
 
-	_, err := f.db.ExecContext(ctx, updateFolderQuery, dstMediaKey, dstFolderName, dstParentPath, srcMediaKey)
+			-- Update items with exact path match
+			UPDATE %s SET path = dst_path
+			WHERE user_name = uname AND path = src_path;
+
+			-- Update items with prefix path match
+			UPDATE %s SET path = dst_path || SUBSTRING(path FROM LENGTH(src_path) + 1)
+			WHERE user_name = uname AND path LIKE src_path || '/%%';
+
+			-- Update subfolder media_keys
+			UPDATE %s SET media_key = 'folder:' || uname || ':' || path || '/' || file_name
+			WHERE user_name = uname AND type = -1
+				AND (path = dst_path OR path LIKE dst_path || '/%%')
+				AND (trash_timestamp IS NULL OR trash_timestamp = 0);
+		END $$;
+	`, srcPath, dstPath, dstFolderName, dstParentPath, userName,
+		f.opt.TableName, f.opt.TableName, f.opt.TableName, f.opt.TableName, f.opt.TableName)
+
+	_, err := f.db.ExecContext(ctx, query)
 	if err != nil {
-		return fmt.Errorf("failed to move folder row: %w", err)
-	}
-
-	// Update all items (files and subfolders) that have path = srcPath
-	// Paths are normalized at startup
-	query1 := fmt.Sprintf(`
-		UPDATE %s
-		SET path = $1
-		WHERE user_name = $2 AND path = $3
-	`, f.opt.TableName)
-
-	_, err = f.db.ExecContext(ctx, query1, dstPath, userName, srcPath)
-	if err != nil {
-		return fmt.Errorf("failed to move directory contents (exact match): %w", err)
-	}
-
-	// Update all items with path starting with srcPath/
-	srcPathPrefix := srcPath + "/"
-	query2 := fmt.Sprintf(`
-		UPDATE %s
-		SET path = $1 || SUBSTRING(path FROM $2)
-		WHERE user_name = $3 AND path LIKE $4
-	`, f.opt.TableName)
-
-	_, err = f.db.ExecContext(ctx, query2, dstPath, len(srcPath)+1, userName, srcPathPrefix+"%")
-	if err != nil {
-		return fmt.Errorf("failed to move directory contents (prefix match): %w", err)
-	}
-
-	// Update media_keys for subfolder rows
-	// Exclude trashed items
-	updateSubfolderKeysQuery := fmt.Sprintf(`
-		UPDATE %s
-		SET media_key = 'folder:' || $1 || ':' || path || '/' || file_name
-		WHERE user_name = $1 AND type = -1 AND (path = $2 OR path LIKE $3)
-			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-	`, f.opt.TableName)
-
-	_, err = f.db.ExecContext(ctx, updateSubfolderKeysQuery, userName, dstPath, dstPath+"/%")
-	if err != nil {
-		return fmt.Errorf("failed to update subfolder keys: %w", err)
+		return fmt.Errorf("failed to move directory: %w", err)
 	}
 
 	// Invalidate caches for source and destination parent directories
