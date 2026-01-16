@@ -282,17 +282,6 @@ type Fs struct {
 	// Put operations wait for this before uploading
 	mountReady     chan struct{}
 	mountReadyOnce sync.Once
-	// deleteQueue for background deletion processing
-	deleteQueue chan deleteRequest
-}
-
-// deleteRequest holds info for background deletion
-type deleteRequest struct {
-	mediaKey       string
-	dedupKey       string
-	userName       string
-	duplicateCount int
-	remote         string // for logging
 }
 
 // Object represents a media file in the database
@@ -461,10 +450,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		dirCache:      cache.New().SetExpireDuration(dirCacheTTL),         // Directory listings (5 min)
 		folderCache:   cache.New().SetExpireDuration(0),                   // Folder existence (never expires, session-only)
 		syncStop:      make(chan struct{}),
-		bgCtx:         bgCtx,
-		bgCancel:      bgCancel,
-		mountReady:    make(chan struct{}),
-		deleteQueue:   make(chan deleteRequest, 100), // Buffer for background deletions
+		bgCtx:      bgCtx,
+		bgCancel:   bgCancel,
+		mountReady: make(chan struct{}),
 	}
 
 	// Initialize Google Photos API client for download URLs
@@ -1575,48 +1563,8 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 
 	userName := f.opt.User
 
-	// First, query all files that will be affected to queue for background deletion
-	// We need media_key, dedup_key to process smart delete from Google Photos
-	selectQuery := fmt.Sprintf(`
-		SELECT media_key, dedup_key, file_name, path,
-			(SELECT COUNT(*) FROM %s d WHERE d.dedup_key = m.dedup_key AND d.user_name = m.user_name) as dup_count
-		FROM %s m
-		WHERE user_name = $1
-			AND (path = $2 OR path LIKE $2 || '/%%')
-			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-			AND type != -1
-	`, f.opt.TableName, f.opt.TableName)
-
-	rows, err := f.db.QueryContext(ctx, selectQuery, userName, folderPath)
-	if err != nil {
-		return fmt.Errorf("failed to query files for purge: %w", err)
-	}
-
-	// Collect files to delete and queue for background processing
-	var filesToDelete []deleteRequest
-	for rows.Next() {
-		var mediaKey, dedupKey, fileName, filePath string
-		var dupCount int
-		if err := rows.Scan(&mediaKey, &dedupKey, &fileName, &filePath, &dupCount); err != nil {
-			rows.Close()
-			return fmt.Errorf("failed to scan file for purge: %w", err)
-		}
-		remotePath := fileName
-		if filePath != "" {
-			remotePath = filePath + "/" + fileName
-		}
-		filesToDelete = append(filesToDelete, deleteRequest{
-			mediaKey:       mediaKey,
-			dedupKey:       dedupKey,
-			userName:       userName,
-			duplicateCount: dupCount,
-			remote:         remotePath,
-		})
-	}
-	rows.Close()
-
 	// Mark all files in this directory and subdirectories as trashed in DB
-	// This handles both files (path = folderPath) and files in subdirs (path LIKE folderPath/%)
+	// Background process will handle actual Google deletion via periodic scan
 	updateQuery := fmt.Sprintf(`
 		UPDATE %s
 		SET trash_timestamp = -1, path = '', name = file_name
@@ -1657,20 +1605,8 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	f.dirCache.DeletePrefix(userName + ":" + folderPath)
 	f.folderCache.DeletePrefix(userName + ":" + folderPath)
 
-	// Queue all files for background deletion from Google Photos
-	// This happens after DB update so OS gets immediate response
-	for _, req := range filesToDelete {
-		select {
-		case f.deleteQueue <- req:
-			// Queued successfully
-		default:
-			// Queue full, log warning but continue
-			fs.Debugf(f, "Purge: delete queue full, skipping background delete for %s", req.remote)
-		}
-	}
-
-	fs.Infof(f, "Purge: removed %s (%d files trashed, %d folders deleted, %d queued for Google deletion)",
-		folderPath, filesAffected, foldersAffected, len(filesToDelete))
+	fs.Infof(f, "Purge: removed %s (%d files trashed, %d folders deleted)",
+		folderPath, filesAffected, foldersAffected)
 	return nil
 }
 
@@ -2249,71 +2185,26 @@ func (o *Object) Remove(ctx context.Context) error {
 		return nil
 	}
 
-	// Quick query to get dedup_key and duplicate count for background processing
-	var dedupKey string
-	var duplicateCount int
-	query := fmt.Sprintf(`
-		SELECT
-			COALESCE(m.dedup_key, '') as dedup_key,
-			CASE
-				WHEN m.dedup_key IS NULL OR m.dedup_key = '' THEN 1
-				ELSE (
-					SELECT COUNT(*) FROM %s
-					WHERE dedup_key = m.dedup_key
-					AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-				)
-			END as duplicate_count
-		FROM %s m
-		WHERE m.media_key = $1
-		AND (m.trash_timestamp IS NULL OR m.trash_timestamp = 0)
-	`, o.fs.opt.TableName, o.fs.opt.TableName)
-	err := o.fs.db.QueryRowContext(ctx, query, o.mediaKey).Scan(&dedupKey, &duplicateCount)
-	if err == sql.ErrNoRows {
-		// File doesn't exist or already trashed - clear cache and return success
-		o.fs.objectCache.Delete(o.remote)
-		o.fs.removeFromDirCache(o.displayPath, o.displayName)
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("failed to get file info: %w", err)
-	}
-
 	// Remove from caches immediately (fast response to OS)
 	o.fs.removeFromDirCache(o.displayPath, o.displayName)
 	o.fs.objectCache.Delete(o.remote)
 
-	// Queue deletion for background processing
-	select {
-	case o.fs.deleteQueue <- deleteRequest{
-		mediaKey:       o.mediaKey,
-		dedupKey:       dedupKey,
-		userName:       o.userName,
-		duplicateCount: duplicateCount,
-		remote:         o.remote,
-	}:
-		fs.Debugf(o.fs, "Queued deletion for %s", o.Remote())
-	default:
-		// Queue full - process synchronously as fallback
-		fs.Debugf(o.fs, "Delete queue full, processing %s synchronously", o.Remote())
-		if duplicateCount <= 1 && dedupKey != "" {
-			if err := o.fs.DeleteFromGPhotos(ctx, []string{dedupKey}, o.userName); err != nil {
-				fs.Errorf(o.fs, "Failed to delete from Google Photos: %v", err)
-			}
-		}
-		updateQuery := fmt.Sprintf(`
-			UPDATE %s SET trash_timestamp = -1, path = '', name = file_name
-			WHERE media_key = $1
-		`, o.fs.opt.TableName)
-		if _, err = o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey); err != nil {
-			return fmt.Errorf("failed to mark for deletion: %w", err)
-		}
+	// Mark as trashed in DB immediately (fast - just an UPDATE)
+	// Background process will handle actual Google deletion via periodic DB scan
+	updateQuery := fmt.Sprintf(`
+		UPDATE %s SET trash_timestamp = -1, path = '', name = file_name
+		WHERE media_key = $1
+	`, o.fs.opt.TableName)
+	_, err := o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
+	if err != nil {
+		return fmt.Errorf("failed to mark for deletion: %w", err)
 	}
 
+	fs.Debugf(o.fs, "Marked %s for deletion (trash_timestamp=-1)", o.Remote())
 	return nil
 }
 
-// processDeleteQueue processes deletion requests in the background
-// It handles both immediate queue items and periodic DB scans for pending deletions
+// processDeleteQueue periodically scans DB for pending deletions and processes them
 func (f *Fs) processDeleteQueue() {
 	// Ticker for periodic DB scan (every 30 seconds)
 	ticker := time.NewTicker(30 * time.Second)
@@ -2324,14 +2215,7 @@ func (f *Fs) processDeleteQueue() {
 		case <-f.bgCtx.Done():
 			fs.Debugf(f, "Background deletion worker stopped")
 			return
-
-		case req := <-f.deleteQueue:
-			// Process immediate deletion request (for fast response to OS)
-			// The actual Google deletion will happen in periodic scan
-			fs.Debugf(f, "Queued for deletion: %s (dedup_key=%s)", req.remote, req.dedupKey)
-
 		case <-ticker.C:
-			// Periodic scan: process all items with trash_timestamp = -1
 			f.processPendingDeletions()
 		}
 	}
