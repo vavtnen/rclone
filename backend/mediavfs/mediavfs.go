@@ -2313,41 +2313,100 @@ func (o *Object) Remove(ctx context.Context) error {
 }
 
 // processDeleteQueue processes deletion requests in the background
+// It handles both immediate queue items and periodic DB scans for pending deletions
 func (f *Fs) processDeleteQueue() {
+	// Ticker for periodic DB scan (every 30 seconds)
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-f.bgCtx.Done():
 			fs.Debugf(f, "Background deletion worker stopped")
 			return
+
 		case req := <-f.deleteQueue:
-			// Process deletion in background
-			ctx, cancel := context.WithTimeout(f.bgCtx, 30*time.Second)
+			// Process immediate deletion request (for fast response to OS)
+			// The actual Google deletion will happen in periodic scan
+			fs.Debugf(f, "Queued for deletion: %s (dedup_key=%s)", req.remote, req.dedupKey)
 
-			if req.duplicateCount <= 1 && req.dedupKey != "" {
-				// Unique file - delete from Google Photos
-				if err := f.DeleteFromGPhotos(ctx, []string{req.dedupKey}, req.userName); err != nil {
-					fs.Errorf(f, "Background delete from Google Photos failed for %s: %v", req.remote, err)
-				}
-			}
+		case <-ticker.C:
+			// Periodic scan: process all items with trash_timestamp = -1
+			f.processPendingDeletions()
+		}
+	}
+}
 
-			// Mark as trashed in database
-			updateQuery := fmt.Sprintf(`
-				UPDATE %s SET trash_timestamp = -1, path = NULL
-				WHERE media_key = $1
-			`, f.opt.TableName)
+// processPendingDeletions scans DB for items with trash_timestamp = -1 and deletes from Google
+func (f *Fs) processPendingDeletions() {
+	ctx, cancel := context.WithTimeout(f.bgCtx, 2*time.Minute)
+	defer cancel()
 
-			_, err := f.db.ExecContext(ctx, updateQuery, req.mediaKey)
-			if err != nil {
-				fs.Errorf(f, "Background delete DB update failed for %s: %v", req.remote, err)
-			} else {
-				if req.duplicateCount <= 1 {
-					fs.Debugf(f, "Background deleted %s from Google Photos", req.remote)
-				} else {
-					fs.Debugf(f, "Background hidden %s locally (has %d duplicates)", req.remote, req.duplicateCount)
-				}
-			}
+	// Find distinct dedup_keys where ALL copies are locally deleted (trash_timestamp = -1)
+	// This ensures we only delete from Google when user has deleted all copies
+	query := fmt.Sprintf(`
+		SELECT DISTINCT dedup_key, user_name
+		FROM %s
+		WHERE trash_timestamp = -1
+			AND dedup_key IS NOT NULL
+			AND dedup_key != ''
+			AND NOT EXISTS (
+				SELECT 1 FROM %s other
+				WHERE other.dedup_key = %s.dedup_key
+					AND other.user_name = %s.user_name
+					AND (other.trash_timestamp IS NULL OR other.trash_timestamp >= 0)
+			)
+	`, f.opt.TableName, f.opt.TableName, f.opt.TableName, f.opt.TableName)
 
-			cancel()
+	rows, err := f.db.QueryContext(ctx, query)
+	if err != nil {
+		fs.Errorf(f, "Failed to query pending deletions: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var toDelete []struct {
+		dedupKey string
+		userName string
+	}
+
+	for rows.Next() {
+		var dedupKey, userName string
+		if err := rows.Scan(&dedupKey, &userName); err != nil {
+			fs.Errorf(f, "Failed to scan pending deletion: %v", err)
+			continue
+		}
+		toDelete = append(toDelete, struct {
+			dedupKey string
+			userName string
+		}{dedupKey, userName})
+	}
+
+	if len(toDelete) == 0 {
+		return
+	}
+
+	fs.Debugf(f, "Processing %d pending deletions from Google Photos", len(toDelete))
+
+	// Delete each unique dedup_key from Google Photos
+	for _, item := range toDelete {
+		if err := f.DeleteFromGPhotos(ctx, []string{item.dedupKey}, item.userName); err != nil {
+			fs.Errorf(f, "Failed to delete %s from Google Photos: %v", item.dedupKey, err)
+			continue
+		}
+
+		// After successful Google deletion, remove all copies from DB
+		deleteQuery := fmt.Sprintf(`
+			DELETE FROM %s
+			WHERE dedup_key = $1 AND user_name = $2 AND trash_timestamp = -1
+		`, f.opt.TableName)
+
+		result, err := f.db.ExecContext(ctx, deleteQuery, item.dedupKey, item.userName)
+		if err != nil {
+			fs.Errorf(f, "Failed to delete %s from DB: %v", item.dedupKey, err)
+		} else {
+			affected, _ := result.RowsAffected()
+			fs.Debugf(f, "Deleted %s from Google Photos and removed %d DB entries", item.dedupKey, affected)
 		}
 	}
 }
@@ -2380,12 +2439,8 @@ func (f *Fs) startBackgroundSync() {
 			case <-f.syncStop:
 				return
 			case <-ticker.C:
-				// Note: We intentionally do NOT process pending deletions here.
-				// Files marked with trash_timestamp = -1 are hidden locally only.
-				// We don't delete from Google Photos to prevent data loss
-				// (deleting one file might remove all duplicates).
-
 				// Sync from Google Photos with timeout
+				// Note: Pending deletions are processed by processDeleteQueue goroutine
 				syncCtx, cancel := context.WithTimeout(f.bgCtx, syncPageTimeout)
 				if err := f.SyncFromGooglePhotos(syncCtx, f.opt.User); err != nil {
 					if f.bgCtx.Err() != nil {
