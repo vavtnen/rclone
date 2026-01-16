@@ -1563,6 +1563,64 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	return nil
 }
 
+// Purge deletes all files in the directory and the directory itself
+// This is much faster than deleting files one by one
+// Implements fs.Purger interface
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	// Get the full path
+	folderPath := strings.Trim(path.Join(f.root, dir), "/")
+	if folderPath == "" {
+		return fmt.Errorf("cannot purge root directory")
+	}
+
+	userName := f.opt.User
+
+	// Mark all files in this directory and subdirectories as trashed
+	// This handles both files (path = folderPath) and files in subdirs (path LIKE folderPath/%)
+	updateQuery := fmt.Sprintf(`
+		UPDATE %s
+		SET trash_timestamp = -1, path = '', name = file_name
+		WHERE user_name = $1
+			AND (path = $2 OR path LIKE $2 || '/%%')
+			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+	`, f.opt.TableName)
+
+	result, err := f.db.ExecContext(ctx, updateQuery, userName, folderPath)
+	if err != nil {
+		return fmt.Errorf("failed to mark files as trashed: %w", err)
+	}
+
+	filesAffected, _ := result.RowsAffected()
+
+	// Delete all folder rows in this directory and subdirectories
+	deleteFoldersQuery := fmt.Sprintf(`
+		DELETE FROM %s
+		WHERE user_name = $1
+			AND type = -1
+			AND (
+				media_key = $2
+				OR media_key LIKE $3
+			)
+	`, f.opt.TableName)
+
+	folderMediaKey := fmt.Sprintf("folder:%s:%s", userName, folderPath)
+	folderMediaKeyPrefix := fmt.Sprintf("folder:%s:%s/%%", userName, folderPath)
+
+	result, err = f.db.ExecContext(ctx, deleteFoldersQuery, userName, folderMediaKey, folderMediaKeyPrefix)
+	if err != nil {
+		return fmt.Errorf("failed to delete folders: %w", err)
+	}
+
+	foldersAffected, _ := result.RowsAffected()
+
+	// Invalidate caches for this directory and all subdirectories
+	f.dirCache.DeletePrefix(userName + ":" + folderPath)
+	f.folderCache.DeletePrefix(userName + ":" + folderPath)
+
+	fs.Infof(f, "Purge: removed %s (%d files trashed, %d folders deleted)", folderPath, filesAffected, foldersAffected)
+	return nil
+}
+
 // Move moves src to this remote
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	srcObj, ok := src.(*Object)
@@ -2494,6 +2552,7 @@ var (
 	_ fs.Fs         = (*Fs)(nil)
 	_ fs.Object     = (*Object)(nil)
 	_ fs.Mover      = (*Fs)(nil)
+	_ fs.Purger     = (*Fs)(nil)
 	_ fs.Shutdowner = (*Fs)(nil)
 	_ fs.ListRer    = (*Fs)(nil)
 )
