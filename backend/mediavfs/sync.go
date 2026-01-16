@@ -379,7 +379,7 @@ func (f *Fs) InsertMediaItems(ctx context.Context, items []gphoto.MediaItem) err
 	query := fmt.Sprintf(`
 		INSERT INTO %s (`, f.opt.TableName)
 	query += `
-			media_key, file_name, dedup_key, is_canonical, type, caption, collection_id,
+			media_key, file_name, name, path, dedup_key, is_canonical, type, caption, collection_id,
 			size_bytes, quota_charged_bytes, origin, content_version, utc_timestamp,
 			server_creation_timestamp, timezone_offset, width, height, remote_url,
 			upload_status, trash_timestamp, is_archived, is_favorite, is_locked,
@@ -388,7 +388,7 @@ func (f *Fs) InsertMediaItems(ctx context.Context, items []gphoto.MediaItem) err
 			duration, capture_frame_rate, encoded_frame_rate, is_micro_video,
 			micro_video_width, micro_video_height, user_name
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+			$1, $2, '', '', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
 			$17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
 			$31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41
 		)
