@@ -1575,7 +1575,47 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 
 	userName := f.opt.User
 
-	// Mark all files in this directory and subdirectories as trashed
+	// First, query all files that will be affected to queue for background deletion
+	// We need media_key, dedup_key to process smart delete from Google Photos
+	selectQuery := fmt.Sprintf(`
+		SELECT media_key, dedup_key, file_name, path,
+			(SELECT COUNT(*) FROM %s d WHERE d.dedup_key = m.dedup_key AND d.user_name = m.user_name) as dup_count
+		FROM %s m
+		WHERE user_name = $1
+			AND (path = $2 OR path LIKE $2 || '/%%')
+			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+			AND type != -1
+	`, f.opt.TableName, f.opt.TableName)
+
+	rows, err := f.db.QueryContext(ctx, selectQuery, userName, folderPath)
+	if err != nil {
+		return fmt.Errorf("failed to query files for purge: %w", err)
+	}
+
+	// Collect files to delete and queue for background processing
+	var filesToDelete []deleteRequest
+	for rows.Next() {
+		var mediaKey, dedupKey, fileName, filePath string
+		var dupCount int
+		if err := rows.Scan(&mediaKey, &dedupKey, &fileName, &filePath, &dupCount); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to scan file for purge: %w", err)
+		}
+		remotePath := fileName
+		if filePath != "" {
+			remotePath = filePath + "/" + fileName
+		}
+		filesToDelete = append(filesToDelete, deleteRequest{
+			mediaKey:       mediaKey,
+			dedupKey:       dedupKey,
+			userName:       userName,
+			duplicateCount: dupCount,
+			remote:         remotePath,
+		})
+	}
+	rows.Close()
+
+	// Mark all files in this directory and subdirectories as trashed in DB
 	// This handles both files (path = folderPath) and files in subdirs (path LIKE folderPath/%)
 	updateQuery := fmt.Sprintf(`
 		UPDATE %s
@@ -1617,7 +1657,20 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	f.dirCache.DeletePrefix(userName + ":" + folderPath)
 	f.folderCache.DeletePrefix(userName + ":" + folderPath)
 
-	fs.Infof(f, "Purge: removed %s (%d files trashed, %d folders deleted)", folderPath, filesAffected, foldersAffected)
+	// Queue all files for background deletion from Google Photos
+	// This happens after DB update so OS gets immediate response
+	for _, req := range filesToDelete {
+		select {
+		case f.deleteQueue <- req:
+			// Queued successfully
+		default:
+			// Queue full, log warning but continue
+			fs.Debugf(f, "Purge: delete queue full, skipping background delete for %s", req.remote)
+		}
+	}
+
+	fs.Infof(f, "Purge: removed %s (%d files trashed, %d folders deleted, %d queued for Google deletion)",
+		folderPath, filesAffected, foldersAffected, len(filesToDelete))
 	return nil
 }
 
