@@ -1758,8 +1758,8 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		dstParentPath = dstPath[:strings.LastIndex(dstPath, "/")]
 	}
 
-	// Single query to do all updates in one round-trip using DO block
-	// This combines: delete existing, update folder, update files, update subfolders
+	// Single query to do all updates - combined path update handles both exact and prefix match
+	// SUBSTRING(path FROM LENGTH(src)+1) returns '' for exact match, '/rest' for prefix match
 	query := fmt.Sprintf(`
 		DO $$
 		DECLARE
@@ -1781,13 +1781,11 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 			UPDATE %s SET media_key = dst_key, file_name = dst_name, path = dst_parent
 			WHERE media_key = src_key;
 
-			-- Update items with exact path match
-			UPDATE %s SET path = dst_path
-			WHERE user_name = uname AND path = src_path;
-
-			-- Update items with prefix path match
+			-- Update all items (files and subfolders) in one query
+			-- For path='a': SUBSTRING('a' FROM 2) = '' → dst_path
+			-- For path='a/b/c': SUBSTRING('a/b/c' FROM 2) = '/b/c' → dst_path || '/b/c'
 			UPDATE %s SET path = dst_path || SUBSTRING(path FROM LENGTH(src_path) + 1)
-			WHERE user_name = uname AND path LIKE src_path || '/%%';
+			WHERE user_name = uname AND (path = src_path OR path LIKE src_path || '/%%');
 
 			-- Update subfolder media_keys
 			UPDATE %s SET media_key = 'folder:' || uname || ':' || path || '/' || file_name
@@ -1796,7 +1794,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 				AND (trash_timestamp IS NULL OR trash_timestamp = 0);
 		END $$;
 	`, srcPath, dstPath, dstFolderName, dstParentPath, userName,
-		f.opt.TableName, f.opt.TableName, f.opt.TableName, f.opt.TableName, f.opt.TableName)
+		f.opt.TableName, f.opt.TableName, f.opt.TableName, f.opt.TableName)
 
 	_, err := f.db.ExecContext(ctx, query)
 	if err != nil {
