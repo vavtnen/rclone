@@ -1349,79 +1349,58 @@ func (f *Fs) ensureFoldersExist(ctx context.Context, userName string, folderPath
 		return nil // Already verified/created
 	}
 
-	// Use a single CTE query to create all folder levels at once
-	// This is much faster than N separate INSERT queries
+	// Build folder data in Go (faster than complex SQL CTE with REGEXP)
+	parts := strings.Split(folderPath, "/")
+	type folderData struct {
+		mediaKey   string
+		folderName string
+		parentPath string
+	}
+	folders := make([]folderData, len(parts))
+
+	currentPath := ""
+	for i, part := range parts {
+		if i == 0 {
+			currentPath = part
+			folders[i] = folderData{
+				mediaKey:   fmt.Sprintf("folder:%s:%s", userName, currentPath),
+				folderName: part,
+				parentPath: "",
+			}
+		} else {
+			parentPath := currentPath
+			currentPath = currentPath + "/" + part
+			folders[i] = folderData{
+				mediaKey:   fmt.Sprintf("folder:%s:%s", userName, currentPath),
+				folderName: part,
+				parentPath: parentPath,
+			}
+		}
+	}
+
+	// Single INSERT with multiple VALUES - much faster than CTE with REGEXP
 	query := fmt.Sprintf(`
-		WITH RECURSIVE
-		-- Split the path into parts
-		path_parts AS (
-			SELECT
-				$1 as full_path,
-				$2 as user_name
-		),
-		-- Generate all folder levels from the path
-		folder_levels AS (
-			SELECT
-				full_path,
-				user_name,
-				CASE
-					WHEN full_path NOT LIKE '%%/%%' THEN full_path
-					ELSE REGEXP_REPLACE(full_path, '/[^/]+$', '')
-				END as parent_check,
-				full_path as current_path,
-				1 as level
-			FROM path_parts
-
-			UNION ALL
-
-			SELECT
-				full_path,
-				user_name,
-				CASE
-					WHEN parent_check NOT LIKE '%%/%%' THEN ''
-					ELSE REGEXP_REPLACE(parent_check, '/[^/]+$', '')
-				END,
-				parent_check,
-				level + 1
-			FROM folder_levels
-			WHERE parent_check != '' AND parent_check != current_path
-		),
-		-- Extract folder name and parent path for each level
-		folders_to_create AS (
-			SELECT DISTINCT
-				current_path,
-				user_name,
-				CASE
-					WHEN current_path NOT LIKE '%%/%%' THEN current_path
-					ELSE REGEXP_REPLACE(current_path, '^.+/', '')
-				END as folder_name,
-				CASE
-					WHEN current_path NOT LIKE '%%/%%' THEN ''
-					ELSE REGEXP_REPLACE(current_path, '/[^/]+$', '')
-				END as parent_path
-			FROM folder_levels
-			WHERE current_path != ''
-		)
 		INSERT INTO %s (media_key, file_name, name, path, type, user_name)
-		SELECT
-			'folder:' || user_name || ':' || current_path,
-			folder_name,
-			'',
-			parent_path,
-			-1,
-			user_name
-		FROM folders_to_create
-		ON CONFLICT (media_key) DO NOTHING
-	`, f.opt.TableName)
+		VALUES `, f.opt.TableName)
 
-	_, err := f.db.ExecContext(ctx, query, folderPath, userName)
+	args := make([]interface{}, 0, len(folders)*4)
+	for i, fd := range folders {
+		if i > 0 {
+			query += ", "
+		}
+		paramBase := i * 4
+		query += fmt.Sprintf("($%d, $%d, '', $%d, -1, $%d)", paramBase+1, paramBase+2, paramBase+3, paramBase+4)
+		args = append(args, fd.mediaKey, fd.folderName, fd.parentPath, userName)
+	}
+	query += " ON CONFLICT (media_key) DO NOTHING"
+
+	_, err := f.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("failed to create folders for %s: %w", folderPath, err)
 	}
 
 	// Cache all folder levels
-	parts := strings.Split(folderPath, "/")
-	currentPath := ""
+	currentPath = ""
 	for i, part := range parts {
 		if i == 0 {
 			currentPath = part
