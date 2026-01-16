@@ -1865,9 +1865,8 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 		if err != nil {
 			if errors.Is(err, gphoto.ErrMediaNotFound) {
 				fs.Errorf(o, "File not found in Google Photos: %s - marking as missing (trash_timestamp=-2)", o.remote)
-				// Set trash_timestamp = -2 and path = NULL to mark as missing/404
-				// path = NULL prevents duplicates if user uploads new file with same name and old file comes back
-				updateQuery := fmt.Sprintf(`UPDATE %s SET trash_timestamp = -2, path = NULL WHERE media_key = $1`, o.fs.opt.TableName)
+				// Set trash_timestamp = -2 to mark as missing/404
+				updateQuery := fmt.Sprintf(`UPDATE %s SET trash_timestamp = -2 WHERE media_key = $1`, o.fs.opt.TableName)
 				_, updateErr := o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
 				if updateErr != nil {
 					fs.Errorf(o, "Failed to mark missing media in database: %v", updateErr)
@@ -2191,7 +2190,7 @@ func (o *Object) Remove(ctx context.Context) error {
 			}
 		}
 		updateQuery := fmt.Sprintf(`
-			UPDATE %s SET trash_timestamp = -1, path = NULL
+			UPDATE %s SET trash_timestamp = -1
 			WHERE media_key = $1
 		`, o.fs.opt.TableName)
 		if _, err = o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey); err != nil {
