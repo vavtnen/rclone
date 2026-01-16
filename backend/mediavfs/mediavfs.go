@@ -1349,45 +1349,86 @@ func (f *Fs) ensureFoldersExist(ctx context.Context, userName string, folderPath
 		return nil // Already verified/created
 	}
 
+	// Use a single CTE query to create all folder levels at once
+	// This is much faster than N separate INSERT queries
+	query := fmt.Sprintf(`
+		WITH RECURSIVE
+		-- Split the path into parts
+		path_parts AS (
+			SELECT
+				$1 as full_path,
+				$2 as user_name
+		),
+		-- Generate all folder levels from the path
+		folder_levels AS (
+			SELECT
+				full_path,
+				user_name,
+				CASE
+					WHEN full_path NOT LIKE '%%/%%' THEN full_path
+					ELSE REGEXP_REPLACE(full_path, '/[^/]+$', '')
+				END as parent_check,
+				full_path as current_path,
+				1 as level
+			FROM path_parts
+
+			UNION ALL
+
+			SELECT
+				full_path,
+				user_name,
+				CASE
+					WHEN parent_check NOT LIKE '%%/%%' THEN ''
+					ELSE REGEXP_REPLACE(parent_check, '/[^/]+$', '')
+				END,
+				parent_check,
+				level + 1
+			FROM folder_levels
+			WHERE parent_check != '' AND parent_check != current_path
+		),
+		-- Extract folder name and parent path for each level
+		folders_to_create AS (
+			SELECT DISTINCT
+				current_path,
+				user_name,
+				CASE
+					WHEN current_path NOT LIKE '%%/%%' THEN current_path
+					ELSE REGEXP_REPLACE(current_path, '^.+/', '')
+				END as folder_name,
+				CASE
+					WHEN current_path NOT LIKE '%%/%%' THEN ''
+					ELSE REGEXP_REPLACE(current_path, '/[^/]+$', '')
+				END as parent_path
+			FROM folder_levels
+			WHERE current_path != ''
+		)
+		INSERT INTO %s (media_key, file_name, name, path, type, user_name)
+		SELECT
+			'folder:' || user_name || ':' || current_path,
+			folder_name,
+			'',
+			parent_path,
+			-1,
+			user_name
+		FROM folders_to_create
+		ON CONFLICT (media_key) DO NOTHING
+	`, f.opt.TableName)
+
+	_, err := f.db.ExecContext(ctx, query, folderPath, userName)
+	if err != nil {
+		return fmt.Errorf("failed to create folders for %s: %w", folderPath, err)
+	}
+
+	// Cache all folder levels
 	parts := strings.Split(folderPath, "/")
-
-	// Build each level of the path and insert
-	parentPath := ""
+	currentPath := ""
 	for i, part := range parts {
-		// The full path of this folder (for media_key)
-		var fullPath string
 		if i == 0 {
-			fullPath = part
+			currentPath = part
 		} else {
-			fullPath = parentPath + "/" + part
+			currentPath = currentPath + "/" + part
 		}
-
-		// Check cache for this specific folder level
-		levelCacheKey := userName + ":" + fullPath
-		_, exists := f.folderCache.GetMaybe(levelCacheKey)
-
-		if !exists {
-			mediaKey := fmt.Sprintf("folder:%s:%s", userName, fullPath)
-
-			// Insert folder if not exists (type = -1 for folders)
-			// path = parent's path, file_name = folder's name, name = '' (not NULL)
-			query := fmt.Sprintf(`
-				INSERT INTO %s (media_key, file_name, name, path, type, user_name)
-				VALUES ($1, $2, '', $3, -1, $4)
-				ON CONFLICT (media_key) DO NOTHING
-			`, f.opt.TableName)
-
-			_, err := f.db.ExecContext(ctx, query, mediaKey, part, parentPath, userName)
-			if err != nil {
-				return fmt.Errorf("failed to create folder %s: %w", fullPath, err)
-			}
-
-			// Mark this folder as existing in cache
-			f.folderCache.Put(levelCacheKey, true)
-		}
-
-		// Update parentPath for next iteration
-		parentPath = fullPath
+		f.folderCache.Put(userName+":"+currentPath, true)
 	}
 
 	return nil
