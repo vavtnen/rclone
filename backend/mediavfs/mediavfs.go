@@ -282,6 +282,17 @@ type Fs struct {
 	// Put operations wait for this before uploading
 	mountReady     chan struct{}
 	mountReadyOnce sync.Once
+	// deleteQueue for background deletion processing
+	deleteQueue chan deleteRequest
+}
+
+// deleteRequest holds info for background deletion
+type deleteRequest struct {
+	mediaKey       string
+	dedupKey       string
+	userName       string
+	duplicateCount int
+	remote         string // for logging
 }
 
 // Object represents a media file in the database
@@ -453,6 +464,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		bgCtx:         bgCtx,
 		bgCancel:      bgCancel,
 		mountReady:    make(chan struct{}),
+		deleteQueue:   make(chan deleteRequest, 100), // Buffer for background deletions
 	}
 
 	// Initialize Google Photos API client for download URLs
@@ -491,6 +503,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	// Note: notifyListener is started lazily in ChangeNotify() - only for mount operations
+
+	// Start background deletion worker
+	go f.processDeleteQueue()
 
 	// Perform initial sync if needed
 	if opt.User != "" {
@@ -2115,26 +2130,20 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	return fmt.Errorf("cannot update existing file (size differs: local=%d remote=%d) - delete and re-upload instead", src.Size(), o.size)
 }
 
-// Remove deletes a file - checks for duplicates first to prevent data loss
+// Remove deletes a file - processes deletion in background for fast response
 // If file has duplicates (same dedup_key), only hides locally (trash_timestamp = -1)
-// If file is unique, deletes from Google Photos server and database
+// If file is unique, deletes from Google Photos server in background
 func (o *Object) Remove(ctx context.Context) error {
 	if !o.fs.opt.EnableDelete {
 		fs.Debugf(o.fs, "Remove disabled for %s", o.Remote())
 		return nil
 	}
 
-	fs.Debugf(o.fs, "Checking duplicates before removing %s", o.Remote())
-
-	// CRITICAL: Get file info and verify it exists at the expected path in the database
-	// This prevents data loss from stale cache entries (e.g., after Move)
-	// Combined query for better performance: gets path, name, dedup_key, and duplicate count
-	var dbPath, dbName, dedupKey string
+	// Quick query to get dedup_key and duplicate count for background processing
+	var dedupKey string
 	var duplicateCount int
 	query := fmt.Sprintf(`
 		SELECT
-			COALESCE(m.path, '') as path,
-			COALESCE(NULLIF(m.name, ''), m.file_name) as name,
 			COALESCE(m.dedup_key, '') as dedup_key,
 			CASE
 				WHEN m.dedup_key IS NULL OR m.dedup_key = '' THEN 1
@@ -2148,83 +2157,89 @@ func (o *Object) Remove(ctx context.Context) error {
 		WHERE m.media_key = $1
 		AND (m.trash_timestamp IS NULL OR m.trash_timestamp = 0)
 	`, o.fs.opt.TableName, o.fs.opt.TableName)
-	err := o.fs.db.QueryRowContext(ctx, query, o.mediaKey).Scan(&dbPath, &dbName, &dedupKey, &duplicateCount)
+	err := o.fs.db.QueryRowContext(ctx, query, o.mediaKey).Scan(&dedupKey, &duplicateCount)
 	if err == sql.ErrNoRows {
-		// File doesn't exist in database - this is a stale cache entry
-		fs.Errorf(o.fs, "CRITICAL: Remove called on stale cache entry %s (media_key=%s not found in database) - refusing to delete", o.Remote(), o.mediaKey)
-		// Clear the stale cache entry
+		// File doesn't exist or already trashed - clear cache and return success
 		o.fs.objectCache.Delete(o.remote)
 		o.fs.removeFromDirCache(o.displayPath, o.displayName)
-		return fs.ErrorObjectNotFound
+		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("failed to get file info: %w", err)
 	}
 
-	// Verify the path matches what we expect
-	expectedPath := strings.Trim(o.displayPath+"/"+o.displayName, "/")
-	actualPath := strings.Trim(dbPath+"/"+dbName, "/")
-	if expectedPath != actualPath {
-		fs.Errorf(o.fs, "CRITICAL: Remove path mismatch - cache has %s but database has %s (media_key=%s) - refusing to delete to prevent data loss", expectedPath, actualPath, o.mediaKey)
-		// Clear the stale cache entry
-		o.fs.objectCache.Delete(o.remote)
-		o.fs.removeFromDirCache(o.displayPath, o.displayName)
-		return fs.ErrorObjectNotFound
-	}
-
-	// Remove from caches
+	// Remove from caches immediately (fast response to OS)
 	o.fs.removeFromDirCache(o.displayPath, o.displayName)
 	o.fs.objectCache.Delete(o.remote)
 
-	if duplicateCount <= 1 {
-		// This is the only copy - safe to delete from Google Photos
-		fs.Debugf(o.fs, "File %s is unique (no duplicates), deleting from Google Photos", o.Remote())
-
-		if dedupKey != "" {
-			// Delete from Google Photos (moves to trash first, then permanent after 60 days)
+	// Queue deletion for background processing
+	select {
+	case o.fs.deleteQueue <- deleteRequest{
+		mediaKey:       o.mediaKey,
+		dedupKey:       dedupKey,
+		userName:       o.userName,
+		duplicateCount: duplicateCount,
+		remote:         o.remote,
+	}:
+		fs.Debugf(o.fs, "Queued deletion for %s", o.Remote())
+	default:
+		// Queue full - process synchronously as fallback
+		fs.Debugf(o.fs, "Delete queue full, processing %s synchronously", o.Remote())
+		if duplicateCount <= 1 && dedupKey != "" {
 			if err := o.fs.DeleteFromGPhotos(ctx, []string{dedupKey}, o.userName); err != nil {
 				fs.Errorf(o.fs, "Failed to delete from Google Photos: %v", err)
-				// Still mark as deleted locally even if Google delete fails
 			}
 		}
-
-		// Mark as trashed locally instead of deleting from DB
-		// Google will update with real trash_timestamp during sync
-		// When user permanently deletes from Google trash, sync will remove from DB
-		// path = NULL prevents duplicates if user uploads new file with same name and old file comes back
 		updateQuery := fmt.Sprintf(`
 			UPDATE %s SET trash_timestamp = -1, path = NULL
 			WHERE media_key = $1
 		`, o.fs.opt.TableName)
-
-		_, err = o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
-		if err != nil {
+		if _, err = o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey); err != nil {
 			return fmt.Errorf("failed to mark for deletion: %w", err)
 		}
-
-		fs.Infof(o.fs, "Deleted %s from Google Photos (moved to trash)", o.Remote())
-	} else {
-		// Multiple copies exist - only hide locally to prevent data loss
-		fs.Debugf(o.fs, "File %s has %d copies, hiding locally only (not deleting from Google Photos)", o.Remote(), duplicateCount)
-
-		// Mark for local deletion by setting trash_timestamp = -1 and path = NULL
-		// Setting path = NULL ensures the file doesn't appear in parent directory listings,
-		// allowing parent folders to be removed without "folder not empty" errors
-		// path = NULL prevents duplicates if user uploads new file with same name and old file comes back
-		updateQuery := fmt.Sprintf(`
-			UPDATE %s SET trash_timestamp = -1, path = NULL
-			WHERE media_key = $1
-		`, o.fs.opt.TableName)
-
-		_, err = o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
-		if err != nil {
-			return fmt.Errorf("failed to mark for deletion: %w", err)
-		}
-
-		fs.Infof(o.fs, "Hidden %s locally (has %d duplicates, not deleted from Google Photos)", o.Remote(), duplicateCount)
 	}
 
 	return nil
+}
+
+// processDeleteQueue processes deletion requests in the background
+func (f *Fs) processDeleteQueue() {
+	for {
+		select {
+		case <-f.bgCtx.Done():
+			fs.Debugf(f, "Background deletion worker stopped")
+			return
+		case req := <-f.deleteQueue:
+			// Process deletion in background
+			ctx, cancel := context.WithTimeout(f.bgCtx, 30*time.Second)
+
+			if req.duplicateCount <= 1 && req.dedupKey != "" {
+				// Unique file - delete from Google Photos
+				if err := f.DeleteFromGPhotos(ctx, []string{req.dedupKey}, req.userName); err != nil {
+					fs.Errorf(f, "Background delete from Google Photos failed for %s: %v", req.remote, err)
+				}
+			}
+
+			// Mark as trashed in database
+			updateQuery := fmt.Sprintf(`
+				UPDATE %s SET trash_timestamp = -1, path = NULL
+				WHERE media_key = $1
+			`, f.opt.TableName)
+
+			_, err := f.db.ExecContext(ctx, updateQuery, req.mediaKey)
+			if err != nil {
+				fs.Errorf(f, "Background delete DB update failed for %s: %v", req.remote, err)
+			} else {
+				if req.duplicateCount <= 1 {
+					fs.Debugf(f, "Background deleted %s from Google Photos", req.remote)
+				} else {
+					fs.Debugf(f, "Background hidden %s locally (has %d duplicates)", req.remote, req.duplicateCount)
+				}
+			}
+
+			cancel()
+		}
+	}
 }
 
 // startBackgroundSync starts a goroutine that performs periodic syncs
