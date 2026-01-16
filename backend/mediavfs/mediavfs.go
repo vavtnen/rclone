@@ -2337,77 +2337,57 @@ func (f *Fs) processDeleteQueue() {
 	}
 }
 
-// processPendingDeletions scans DB for items with trash_timestamp = -1 and deletes from Google
+// processPendingDeletions scans DB for ONE item with trash_timestamp = -1 and deletes from Google
+// Processes only one dedup_key per cycle to avoid rate limiting and spread load over time
 func (f *Fs) processPendingDeletions() {
-	ctx, cancel := context.WithTimeout(f.bgCtx, 2*time.Minute)
+	ctx, cancel := context.WithTimeout(f.bgCtx, 30*time.Second)
 	defer cancel()
 
-	// Find distinct dedup_keys where ALL copies are locally deleted (trash_timestamp = -1)
-	// This ensures we only delete from Google when user has deleted all copies
+	// Find ONE dedup_key where ALL copies are locally deleted (trash_timestamp = -1)
+	// LIMIT 1 ensures we only process one deletion per cycle
 	query := fmt.Sprintf(`
 		SELECT DISTINCT dedup_key, user_name
-		FROM %s
+		FROM %s m
 		WHERE trash_timestamp = -1
 			AND dedup_key IS NOT NULL
 			AND dedup_key != ''
 			AND NOT EXISTS (
 				SELECT 1 FROM %s other
-				WHERE other.dedup_key = %s.dedup_key
-					AND other.user_name = %s.user_name
+				WHERE other.dedup_key = m.dedup_key
+					AND other.user_name = m.user_name
 					AND (other.trash_timestamp IS NULL OR other.trash_timestamp >= 0)
 			)
-	`, f.opt.TableName, f.opt.TableName, f.opt.TableName, f.opt.TableName)
+		LIMIT 1
+	`, f.opt.TableName, f.opt.TableName)
 
-	rows, err := f.db.QueryContext(ctx, query)
+	var dedupKey, userName string
+	err := f.db.QueryRowContext(ctx, query).Scan(&dedupKey, &userName)
+	if err == sql.ErrNoRows {
+		return // No pending deletions
+	}
 	if err != nil {
-		fs.Errorf(f, "Failed to query pending deletions: %v", err)
-		return
-	}
-	defer rows.Close()
-
-	var toDelete []struct {
-		dedupKey string
-		userName string
-	}
-
-	for rows.Next() {
-		var dedupKey, userName string
-		if err := rows.Scan(&dedupKey, &userName); err != nil {
-			fs.Errorf(f, "Failed to scan pending deletion: %v", err)
-			continue
-		}
-		toDelete = append(toDelete, struct {
-			dedupKey string
-			userName string
-		}{dedupKey, userName})
-	}
-
-	if len(toDelete) == 0 {
+		fs.Errorf(f, "Failed to query pending deletion: %v", err)
 		return
 	}
 
-	fs.Debugf(f, "Processing %d pending deletions from Google Photos", len(toDelete))
+	// Delete from Google Photos
+	if err := f.DeleteFromGPhotos(ctx, []string{dedupKey}, userName); err != nil {
+		fs.Errorf(f, "Failed to delete %s from Google Photos: %v", dedupKey, err)
+		return
+	}
 
-	// Delete each unique dedup_key from Google Photos
-	for _, item := range toDelete {
-		if err := f.DeleteFromGPhotos(ctx, []string{item.dedupKey}, item.userName); err != nil {
-			fs.Errorf(f, "Failed to delete %s from Google Photos: %v", item.dedupKey, err)
-			continue
-		}
+	// After successful Google deletion, remove all copies with this dedup_key from DB
+	deleteQuery := fmt.Sprintf(`
+		DELETE FROM %s
+		WHERE dedup_key = $1 AND user_name = $2 AND trash_timestamp = -1
+	`, f.opt.TableName)
 
-		// After successful Google deletion, remove all copies from DB
-		deleteQuery := fmt.Sprintf(`
-			DELETE FROM %s
-			WHERE dedup_key = $1 AND user_name = $2 AND trash_timestamp = -1
-		`, f.opt.TableName)
-
-		result, err := f.db.ExecContext(ctx, deleteQuery, item.dedupKey, item.userName)
-		if err != nil {
-			fs.Errorf(f, "Failed to delete %s from DB: %v", item.dedupKey, err)
-		} else {
-			affected, _ := result.RowsAffected()
-			fs.Debugf(f, "Deleted %s from Google Photos and removed %d DB entries", item.dedupKey, affected)
-		}
+	result, err := f.db.ExecContext(ctx, deleteQuery, dedupKey, userName)
+	if err != nil {
+		fs.Errorf(f, "Failed to delete %s from DB: %v", dedupKey, err)
+	} else {
+		affected, _ := result.RowsAffected()
+		fs.Debugf(f, "Deleted %s from Google Photos and removed %d DB entries", dedupKey, affected)
 	}
 }
 
