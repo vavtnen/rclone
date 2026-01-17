@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -853,4 +855,243 @@ func (api *API) GetDownloadURL(ctx context.Context, mediaKey string) (string, er
 	}
 
 	return "", fmt.Errorf("download URL not found in response for media_key %s", mediaKey)
+}
+
+// UnsupportedVideoItem represents an unsupported video from the batchexecute API
+type UnsupportedVideoItem struct {
+	MediaKey     string
+	FileName     string
+	Size         int64
+	Timestamp    int64
+	ThumbnailURL string
+	DownloadURL  string
+	Hash         string
+}
+
+// WebSession holds web session cookies needed for batchexecute API
+type WebSession struct {
+	SAPISID string
+	SID     string
+	HSID    string
+	SSID    string
+	OSID    string
+}
+
+// generateSAPISIDHash generates the SAPISIDHASH for web authentication
+// Formula: SAPISIDHASH = timestamp_HASH where HASH = sha1(timestamp + " " + SAPISID + " " + origin)
+func generateSAPISIDHash(sapisid, origin string) string {
+	timestamp := time.Now().Unix()
+	toHash := fmt.Sprintf("%d %s %s", timestamp, sapisid, origin)
+	hash := sha256.Sum256([]byte(toHash))
+	return fmt.Sprintf("%d_%x", timestamp, hash)
+}
+
+// GetUnsupportedVideos fetches the list of unsupported videos using the batchexecute API
+// This requires web session cookies (SAPISID, SID) which can be obtained from a browser session
+func (api *API) GetUnsupportedVideos(ctx context.Context, session *WebSession, pageToken string) ([]UnsupportedVideoItem, string, error) {
+	if session == nil || session.SAPISID == "" {
+		return nil, "", fmt.Errorf("web session required for unsupported videos API")
+	}
+
+	origin := "https://photos.google.com"
+	sapisidhash := generateSAPISIDHash(session.SAPISID, origin)
+
+	// Build the f.req parameter for TLvKMb RPC
+	// Format: [[["TLvKMb","[\"pageToken\"]",null,"generic"]]]
+	var innerReq string
+	if pageToken == "" {
+		innerReq = "[]"
+	} else {
+		innerReq = fmt.Sprintf("[\"%s\"]", pageToken)
+	}
+
+	freqData := fmt.Sprintf(`[[["TLvKMb",%q,null,"generic"]]]`, innerReq)
+
+	// URL encode the request
+	formData := url.Values{
+		"f.req": {freqData},
+	}
+
+	reqURL := "https://photos.google.com/_/PhotosUi/data/batchexecute?rpcids=TLvKMb&source-path=%2Funsupportedvideos&hl=en&soc-app=165&soc-platform=1&soc-device=1"
+
+	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	// Set headers
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", "https://photos.google.com/unsupportedvideos")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("X-Same-Domain", "1")
+	req.Header.Set("Authorization", "SAPISIDHASH "+sapisidhash)
+
+	// Set cookies
+	cookies := fmt.Sprintf("SAPISID=%s; SID=%s; HSID=%s; SSID=%s",
+		session.SAPISID, session.SID, session.HSID, session.SSID)
+	if session.OSID != "" {
+		cookies += fmt.Sprintf("; OSID=%s", session.OSID)
+	}
+	req.Header.Set("Cookie", cookies)
+
+	resp, err := api.httpClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("batchexecute request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, "", fmt.Errorf("batchexecute failed with status %d: %s", resp.StatusCode, string(body[:min(len(body), 500)]))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	return parseBatchExecuteUnsupportedVideos(body)
+}
+
+// parseBatchExecuteUnsupportedVideos parses the batchexecute response for unsupported videos
+// Response format: )]}'  followed by length and JSON data
+func parseBatchExecuteUnsupportedVideos(body []byte) ([]UnsupportedVideoItem, string, error) {
+	bodyStr := string(body)
+
+	// Skip the garbage prefix )]}'
+	idx := strings.Index(bodyStr, "\n")
+	if idx == -1 {
+		return nil, "", fmt.Errorf("invalid batchexecute response format")
+	}
+	bodyStr = bodyStr[idx+1:]
+
+	// Skip the length line
+	idx = strings.Index(bodyStr, "\n")
+	if idx == -1 {
+		return nil, "", fmt.Errorf("invalid batchexecute response format: no length line")
+	}
+	bodyStr = bodyStr[idx+1:]
+
+	// Parse the JSON array
+	// Format: [["wrb.fr","TLvKMb","[nextPageToken,[[item1],[item2],...]]",null,null,null,"generic"]]
+	var outerArray []interface{}
+	if err := json.Unmarshal([]byte(bodyStr), &outerArray); err != nil {
+		return nil, "", fmt.Errorf("failed to parse outer JSON: %w", err)
+	}
+
+	if len(outerArray) == 0 {
+		return nil, "", nil
+	}
+
+	// Get the first element which is the response array
+	respArray, ok := outerArray[0].([]interface{})
+	if !ok || len(respArray) < 3 {
+		return nil, "", fmt.Errorf("invalid response array structure")
+	}
+
+	// Check RPC ID
+	rpcID, _ := respArray[1].(string)
+	if rpcID != "TLvKMb" {
+		return nil, "", fmt.Errorf("unexpected RPC ID: %s", rpcID)
+	}
+
+	// Parse the inner JSON data (index 2)
+	innerDataStr, ok := respArray[2].(string)
+	if !ok {
+		return nil, "", fmt.Errorf("inner data is not a string")
+	}
+
+	var innerData []interface{}
+	if err := json.Unmarshal([]byte(innerDataStr), &innerData); err != nil {
+		return nil, "", fmt.Errorf("failed to parse inner JSON: %w", err)
+	}
+
+	if len(innerData) < 2 {
+		return nil, "", nil
+	}
+
+	// Extract next page token (index 0)
+	var nextPageToken string
+	if token, ok := innerData[0].(string); ok {
+		nextPageToken = token
+	}
+
+	// Extract video items (index 1)
+	itemsArray, ok := innerData[1].([]interface{})
+	if !ok {
+		return nil, nextPageToken, nil
+	}
+
+	var items []UnsupportedVideoItem
+	for _, itemData := range itemsArray {
+		item, err := parseUnsupportedVideoItem(itemData)
+		if err != nil {
+			fs.Debugf(nil, "gphoto: skipping unsupported video item: %v", err)
+			continue
+		}
+		items = append(items, item)
+	}
+
+	return items, nextPageToken, nil
+}
+
+// parseUnsupportedVideoItem parses a single unsupported video item from the response
+// Format: [mediaKey, fileName, size, timestamp, thumbnailURL, downloadURL, hash]
+func parseUnsupportedVideoItem(data interface{}) (UnsupportedVideoItem, error) {
+	arr, ok := data.([]interface{})
+	if !ok || len(arr) < 7 {
+		return UnsupportedVideoItem{}, fmt.Errorf("invalid item format: expected array with 7 elements")
+	}
+
+	item := UnsupportedVideoItem{}
+
+	// Index 0: media key
+	if v, ok := arr[0].(string); ok {
+		item.MediaKey = v
+	}
+
+	// Index 1: file name
+	if v, ok := arr[1].(string); ok {
+		item.FileName = v
+	}
+
+	// Index 2: size
+	if v, ok := arr[2].(float64); ok {
+		item.Size = int64(v)
+	}
+
+	// Index 3: timestamp
+	if v, ok := arr[3].(float64); ok {
+		item.Timestamp = int64(v)
+	}
+
+	// Index 4: thumbnail URL
+	if v, ok := arr[4].(string); ok {
+		item.ThumbnailURL = v
+	}
+
+	// Index 5: download URL (the key field!)
+	if v, ok := arr[5].(string); ok {
+		item.DownloadURL = v
+	}
+
+	// Index 6: hash
+	if v, ok := arr[6].(string); ok {
+		item.Hash = v
+	}
+
+	if item.MediaKey == "" || item.DownloadURL == "" {
+		return UnsupportedVideoItem{}, fmt.Errorf("missing required fields: mediaKey=%s downloadURL=%s", item.MediaKey, item.DownloadURL)
+	}
+
+	return item, nil
+}
+
+// min returns the smaller of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
