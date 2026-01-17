@@ -253,7 +253,7 @@ func (api *API) request(ctx context.Context, method, url string, headers map[str
 			authRetries++
 			// Always force refresh on auth errors - the server has rejected the token,
 			// so we should not reuse it even if it hasn't expired locally
-			fs.Debugf(nil, "gphoto: auth error (%d), retry %d/5, forcing token refresh", lastStatusCode, retry+1)
+			fs.Infof(nil, "gphoto: auth error (%d), retry %d/5, forcing token refresh", lastStatusCode, retry+1)
 			if err := api.GetAuthToken(ctx, true); err != nil {
 				return nil, fmt.Errorf("auth refresh failed after %d: %w", lastStatusCode, err)
 			}
