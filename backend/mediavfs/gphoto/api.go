@@ -180,7 +180,7 @@ func (api *API) request(ctx context.Context, method, url string, headers map[str
 	var resp *http.Response
 	var err error
 	var bodyBytes []byte
-	authRetries := 0    // Track auth failures to escalate to force refresh
+	authRetries := 0    // Track auth failures for debugging
 	lastStatusCode := 0 // Track last status code for error reporting
 
 	// If body is provided, read it into memory so we can retry
@@ -251,9 +251,10 @@ func (api *API) request(ctx context.Context, method, url string, headers map[str
 			lastStatusCode = resp.StatusCode
 			resp.Body.Close()
 			authRetries++
-			forceRefresh := authRetries > 1
-			fs.Debugf(nil, "gphoto: auth error (%d), retry %d/5, forceRefresh=%v", lastStatusCode, retry+1, forceRefresh)
-			if err := api.GetAuthToken(ctx, forceRefresh); err != nil {
+			// Always force refresh on auth errors - the server has rejected the token,
+			// so we should not reuse it even if it hasn't expired locally
+			fs.Debugf(nil, "gphoto: auth error (%d), retry %d/5, forcing token refresh", lastStatusCode, retry+1)
+			if err := api.GetAuthToken(ctx, true); err != nil {
 				return nil, fmt.Errorf("auth refresh failed after %d: %w", lastStatusCode, err)
 			}
 			continue
