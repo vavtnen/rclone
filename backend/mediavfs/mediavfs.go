@@ -228,6 +228,22 @@ func init() {
 			Help:     "Interval between automatic syncs in seconds. Only used when auto_sync is enabled.",
 			Default:  60,
 			Advanced: true,
+		}, {
+			Name:     "web_sapisid",
+			Help:     "SAPISID cookie from browser session for unsupported videos API.\n\nRequired for downloading unsupported videos. Get from browser dev tools.",
+			Advanced: true,
+		}, {
+			Name:     "web_sid",
+			Help:     "SID cookie from browser session for unsupported videos API.",
+			Advanced: true,
+		}, {
+			Name:     "web_hsid",
+			Help:     "HSID cookie from browser session for unsupported videos API.",
+			Advanced: true,
+		}, {
+			Name:     "web_ssid",
+			Help:     "SSID cookie from browser session for unsupported videos API.",
+			Advanced: true,
 		}},
 	}
 	fs.Register(fsi)
@@ -248,6 +264,11 @@ type Options struct {
 	AndroidID      string `config:"android_id"`
 	AutoSync       bool   `config:"auto_sync"`
 	SyncInterval   int    `config:"sync_interval"`
+	// Web session cookies for unsupported videos API
+	WebSAPISID string `config:"web_sapisid"`
+	WebSID     string `config:"web_sid"`
+	WebHSID    string `config:"web_hsid"`
+	WebSSID    string `config:"web_ssid"`
 }
 
 // Fs represents a connection to the media database
@@ -1905,6 +1926,25 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 		initialURL, err := o.fs.api.GetDownloadURL(ctx, o.mediaKey)
 		if err != nil {
 			if errors.Is(err, gphoto.ErrMediaNotFound) {
+				// Try fallback to unsupported video URL before marking as missing
+				unsupportedURL, fallbackErr := o.fs.GetUnsupportedVideoURL(ctx, o.mediaKey)
+				if fallbackErr != nil {
+					fs.Debugf(o, "Error checking unsupported video URL: %v", fallbackErr)
+				}
+				if unsupportedURL != "" {
+					fs.Infof(o, "Using unsupported video download URL for %s", o.remote)
+					// The unsupported video URL is a direct download URL
+					meta := &urlMetadata{
+						resolvedURL: unsupportedURL,
+						etag:        "", // No ETag for unsupported videos
+						size:        o.size,
+						expiresAt:   time.Now().Add(50 * time.Minute), // Shorter TTL for unsupported videos
+						lastAccess:  time.Now(),
+					}
+					o.fs.urlCache.set(cacheKey, meta)
+					return meta, nil
+				}
+
 				fs.Errorf(o, "File not found in Google Photos: %s - marking as missing (trash_timestamp=-2)", o.remote)
 				// Set trash_timestamp = -2, path = '', name = file_name to mark as missing/404
 				updateQuery := fmt.Sprintf(`UPDATE %s SET trash_timestamp = -2, path = '', name = file_name WHERE media_key = $1`, o.fs.opt.TableName)
@@ -2435,6 +2475,107 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 
 	fs.Debugf(f, "ListR completed")
 	return nil
+}
+
+// GetWebSession returns the web session from config if available
+func (f *Fs) GetWebSession() *gphoto.WebSession {
+	if f.opt.WebSAPISID == "" {
+		return nil
+	}
+	return &gphoto.WebSession{
+		SAPISID: f.opt.WebSAPISID,
+		SID:     f.opt.WebSID,
+		HSID:    f.opt.WebHSID,
+		SSID:    f.opt.WebSSID,
+	}
+}
+
+// SyncUnsupportedVideos fetches unsupported video download URLs and stores them in the database
+// Returns the number of videos synced
+func (f *Fs) SyncUnsupportedVideos(ctx context.Context) (int, error) {
+	session := f.GetWebSession()
+	if session == nil {
+		return 0, fmt.Errorf("web session cookies not configured (set web_sapisid, web_sid, web_hsid, web_ssid)")
+	}
+
+	fs.Infof(f, "Starting unsupported videos sync...")
+
+	totalSynced := 0
+	pageToken := ""
+
+	for {
+		items, nextPage, err := f.api.GetUnsupportedVideos(ctx, session, pageToken)
+		if err != nil {
+			return totalSynced, fmt.Errorf("failed to fetch unsupported videos: %w", err)
+		}
+
+		if len(items) == 0 {
+			break
+		}
+
+		// Store download URLs in database
+		for _, item := range items {
+			err := f.storeUnsupportedVideoURL(ctx, item.MediaKey, item.DownloadURL)
+			if err != nil {
+				fs.Errorf(f, "Failed to store URL for %s: %v", item.MediaKey, err)
+				continue
+			}
+			totalSynced++
+		}
+
+		fs.Debugf(f, "Synced %d unsupported videos, nextPage=%v", len(items), nextPage != "")
+
+		if nextPage == "" {
+			break
+		}
+		pageToken = nextPage
+	}
+
+	fs.Infof(f, "Unsupported videos sync complete: %d videos synced", totalSynced)
+	return totalSynced, nil
+}
+
+// storeUnsupportedVideoURL stores the download URL for an unsupported video
+func (f *Fs) storeUnsupportedVideoURL(ctx context.Context, mediaKey, downloadURL string) error {
+	query := fmt.Sprintf(`
+		UPDATE %s
+		SET unsupported_video_url = $1, updated_at = NOW()
+		WHERE media_key = $2 AND user_name = $3
+	`, f.opt.TableName)
+
+	result, err := f.db.ExecContext(ctx, query, downloadURL, mediaKey, f.opt.User)
+	if err != nil {
+		return fmt.Errorf("failed to update URL: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		// Media key not found in database - this is expected for unsupported videos
+		// that might not be in the regular library sync
+		fs.Debugf(f, "Media key %s not found in database, skipping URL store", mediaKey)
+	}
+
+	return nil
+}
+
+// GetUnsupportedVideoURL retrieves the stored download URL for an unsupported video
+func (f *Fs) GetUnsupportedVideoURL(ctx context.Context, mediaKey string) (string, error) {
+	query := fmt.Sprintf(`
+		SELECT unsupported_video_url
+		FROM %s
+		WHERE media_key = $1 AND user_name = $2 AND unsupported_video_url IS NOT NULL
+	`, f.opt.TableName)
+
+	var downloadURL string
+	err := f.db.QueryRowContext(ctx, query, mediaKey, f.opt.User).Scan(&downloadURL)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+
+	return downloadURL, nil
 }
 
 // Check the interfaces are satisfied
