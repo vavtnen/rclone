@@ -2262,7 +2262,6 @@ func (f *Fs) startBackgroundSync() {
 				return
 			case <-ticker.C:
 				// Sync from Google Photos with timeout
-				// Note: Pending deletions are processed by processDeleteQueue goroutine
 				syncCtx, cancel := context.WithTimeout(f.bgCtx, syncPageTimeout)
 				if err := f.SyncFromGooglePhotos(syncCtx, f.opt.User); err != nil {
 					if f.bgCtx.Err() != nil {
