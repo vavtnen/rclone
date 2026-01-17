@@ -492,9 +492,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	// Note: notifyListener is started lazily in ChangeNotify() - only for mount operations
 
-	// Start background deletion worker
-	go f.processDeleteQueue()
-
 	// Perform initial sync if needed
 	if opt.User != "" {
 		fs.Debugf(f, "Checking sync state for user: %s", opt.User)
@@ -2168,9 +2165,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	return fmt.Errorf("cannot update existing file (size differs: local=%d remote=%d) - delete and re-upload instead", src.Size(), o.size)
 }
 
-// Remove deletes a file - processes deletion in background for fast response
-// If file has duplicates (same dedup_key), only hides locally (trash_timestamp = -1)
-// If file is unique, deletes from Google Photos server in background
+// Remove hides a file locally by marking it as deleted in the database.
+// Sets trash_timestamp = -1 and path = '' to hide from file listings.
+// Does NOT delete from Google Photos server - file remains on Google.
 func (o *Object) Remove(ctx context.Context) error {
 	if !o.fs.opt.EnableDelete {
 		fs.Debugf(o.fs, "Remove disabled for %s", o.Remote())
@@ -2181,90 +2178,19 @@ func (o *Object) Remove(ctx context.Context) error {
 	o.fs.removeFromDirCache(o.displayPath, o.displayName)
 	o.fs.objectCache.Delete(o.remote)
 
-	// Mark as trashed in DB immediately (fast - just an UPDATE)
-	// Background process will handle actual Google deletion via periodic DB scan
+	// Mark as hidden in DB (trash_timestamp = -1, path = '')
+	// File remains on Google Photos server, only hidden locally
 	updateQuery := fmt.Sprintf(`
-		UPDATE %s SET trash_timestamp = -1, path = '', name = file_name
+		UPDATE %s SET trash_timestamp = -1, path = ''
 		WHERE media_key = $1
 	`, o.fs.opt.TableName)
 	_, err := o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
 	if err != nil {
-		return fmt.Errorf("failed to mark for deletion: %w", err)
+		return fmt.Errorf("failed to mark as hidden: %w", err)
 	}
 
-	fs.Debugf(o.fs, "Marked %s for deletion (trash_timestamp=-1)", o.Remote())
+	fs.Debugf(o.fs, "Marked %s as hidden (trash_timestamp=-1, path='')", o.Remote())
 	return nil
-}
-
-// processDeleteQueue periodically scans DB for pending deletions and processes them
-func (f *Fs) processDeleteQueue() {
-	// Ticker for periodic DB scan (every 30 seconds)
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-f.bgCtx.Done():
-			fs.Debugf(f, "Background deletion worker stopped")
-			return
-		case <-ticker.C:
-			f.processPendingDeletions()
-		}
-	}
-}
-
-// processPendingDeletions scans DB for ONE item with trash_timestamp = -1 and deletes from Google
-// Processes only one dedup_key per cycle to avoid rate limiting and spread load over time
-func (f *Fs) processPendingDeletions() {
-	ctx, cancel := context.WithTimeout(f.bgCtx, 30*time.Second)
-	defer cancel()
-
-	// Find ONE dedup_key where ALL copies are locally deleted (trash_timestamp = -1)
-	// LIMIT 1 ensures we only process one deletion per cycle
-	query := fmt.Sprintf(`
-		SELECT DISTINCT dedup_key, user_name
-		FROM %s m
-		WHERE trash_timestamp = -1
-			AND dedup_key IS NOT NULL
-			AND dedup_key != ''
-			AND NOT EXISTS (
-				SELECT 1 FROM %s other
-				WHERE other.dedup_key = m.dedup_key
-					AND other.user_name = m.user_name
-					AND (other.trash_timestamp IS NULL OR other.trash_timestamp >= 0)
-			)
-		LIMIT 1
-	`, f.opt.TableName, f.opt.TableName)
-
-	var dedupKey, userName string
-	err := f.db.QueryRowContext(ctx, query).Scan(&dedupKey, &userName)
-	if err == sql.ErrNoRows {
-		return // No pending deletions
-	}
-	if err != nil {
-		fs.Errorf(f, "Failed to query pending deletion: %v", err)
-		return
-	}
-
-	// Delete from Google Photos
-	if err := f.DeleteFromGPhotos(ctx, []string{dedupKey}, userName); err != nil {
-		fs.Errorf(f, "Failed to delete %s from Google Photos: %v", dedupKey, err)
-		return
-	}
-
-	// After successful Google deletion, remove all copies with this dedup_key from DB
-	deleteQuery := fmt.Sprintf(`
-		DELETE FROM %s
-		WHERE dedup_key = $1 AND user_name = $2 AND trash_timestamp = -1
-	`, f.opt.TableName)
-
-	result, err := f.db.ExecContext(ctx, deleteQuery, dedupKey, userName)
-	if err != nil {
-		fs.Errorf(f, "Failed to delete %s from DB: %v", dedupKey, err)
-	} else {
-		affected, _ := result.RowsAffected()
-		fs.Debugf(f, "Deleted %s from Google Photos and removed %d DB entries", dedupKey, affected)
-	}
 }
 
 // startBackgroundSync starts a goroutine that performs periodic syncs
