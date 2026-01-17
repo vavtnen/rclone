@@ -2040,29 +2040,24 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	etag := meta.etag
 	fileSize := meta.size
 
-	// Check if this is a range/seek request (not initial download)
-	// A range starting at 0 is still considered an initial download
-	isRangeRequest := false
+	// Extract range information from options
+	var rangeStart, rangeEnd int64 = 0, fileSize - 1
 	for _, opt := range options {
 		switch x := opt.(type) {
 		case *fs.RangeOption:
-			if x.Start > 0 {
-				isRangeRequest = true
+			rangeStart = x.Start
+			if x.End >= 0 {
+				rangeEnd = x.End
 			}
 		case *fs.SeekOption:
-			if x.Offset > 0 {
-				isRangeRequest = true
-			}
+			rangeStart = x.Offset
 		}
 	}
 
-	// Log debug message only for initial download, not for seeks
-	if !isRangeRequest {
-		fs.Debugf(o, "Starting download: %s", o.remote)
-	}
+	// Log download with range info
+	fs.Infof(o, "Downloading %s %s %d-%d", o.remote, o.mediaKey, rangeStart, rangeEnd)
 
 	// Now make the actual GET request to the resolved URL with retry logic
-	fs.Debugf(o, "Downloading: %s", o.remote)
 	var res *http.Response
 	var getErr error
 	for attempt := 0; attempt < 3; attempt++ {
