@@ -111,9 +111,19 @@ func (f *Fs) InitializeDatabase(ctx context.Context) error {
 		return fmt.Errorf("failed to create path indices: %w", err)
 	}
 
-	// Normalize paths - strip trailing slashes from all paths
-	if err := f.normalizePathsInDB(ctx); err != nil {
-		fs.Errorf(f, "Failed to normalize paths (non-fatal): %v", err)
+	// Add UNIQUE constraint to prevent duplicate files in same path
+	// Uses COALESCE(NULLIF(name, ''), file_name) as display name
+	// Only applies to non-trashed items (partial unique index)
+	uniqueIndexQuery := fmt.Sprintf(`
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_%s_unique_path_name
+		ON %s(user_name, path, COALESCE(NULLIF(name, ''), file_name))
+		WHERE (trash_timestamp IS NULL OR trash_timestamp = 0);
+	`, f.opt.TableName, f.opt.TableName)
+
+	_, err = f.db.ExecContext(ctx, uniqueIndexQuery)
+	if err != nil {
+		// Non-fatal - might fail if duplicates already exist
+		fs.Errorf(f, "Failed to create unique index (duplicates may exist): %v", err)
 	}
 
 	// Create missing folder rows for paths that have files but no folder entry
@@ -127,62 +137,6 @@ func (f *Fs) InitializeDatabase(ctx context.Context) error {
 	}
 
 	fs.Debugf(f, "Database schema initialized successfully")
-	return nil
-}
-
-// normalizePathsInDB strips leading/trailing slashes from all path values in the database
-func (f *Fs) normalizePathsInDB(ctx context.Context) error {
-	// Update paths that have trailing slashes
-	query := fmt.Sprintf(`
-		UPDATE %s
-		SET path = TRIM(BOTH '/' FROM path)
-		WHERE path LIKE '%%/' OR path LIKE '/%%'
-	`, f.opt.TableName)
-
-	result, err := f.db.ExecContext(ctx, query)
-	if err != nil {
-		return fmt.Errorf("failed to normalize paths: %w", err)
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected > 0 {
-		fs.Debugf(f, "Normalized %d paths by removing leading/trailing slashes", rowsAffected)
-	}
-
-	// Also normalize file_name column (strip slashes)
-	query2 := fmt.Sprintf(`
-		UPDATE %s
-		SET file_name = TRIM(BOTH '/' FROM file_name)
-		WHERE file_name LIKE '%%/' OR file_name LIKE '/%%'
-	`, f.opt.TableName)
-
-	result2, err := f.db.ExecContext(ctx, query2)
-	if err != nil {
-		return fmt.Errorf("failed to normalize file_names: %w", err)
-	}
-
-	rowsAffected2, _ := result2.RowsAffected()
-	if rowsAffected2 > 0 {
-		fs.Debugf(f, "Normalized %d file_names by removing slashes", rowsAffected2)
-	}
-
-	// Also normalize name column (custom name, strip slashes)
-	query3 := fmt.Sprintf(`
-		UPDATE %s
-		SET name = TRIM(BOTH '/' FROM name)
-		WHERE name LIKE '%%/' OR name LIKE '/%%'
-	`, f.opt.TableName)
-
-	result3, err := f.db.ExecContext(ctx, query3)
-	if err != nil {
-		return fmt.Errorf("failed to normalize names: %w", err)
-	}
-
-	rowsAffected3, _ := result3.RowsAffected()
-	if rowsAffected3 > 0 {
-		fs.Debugf(f, "Normalized %d names by removing slashes", rowsAffected3)
-	}
-
 	return nil
 }
 
@@ -223,14 +177,15 @@ func (f *Fs) createMissingFolders(ctx context.Context) error {
 			WHERE full_path != ''
 			AND full_path NOT IN (SELECT folder_path FROM existing_folders)
 		)
-		-- Insert missing folder rows
-		INSERT INTO %s (media_key, file_name, path, type, user_name)
+		-- Insert missing folder rows (name = '' to avoid NULL)
+		INSERT INTO %s (media_key, file_name, name, path, type, user_name)
 		SELECT
 			'folder:' || $1 || ':' || full_path,
 			CASE
 				WHEN full_path NOT LIKE '%%/%%' THEN full_path
 				ELSE REGEXP_REPLACE(full_path, '^.+/', '')
 			END,
+			'',
 			CASE
 				WHEN full_path NOT LIKE '%%/%%' THEN ''
 				ELSE REGEXP_REPLACE(full_path, '/[^/]+$', '')
@@ -331,10 +286,11 @@ func (f *Fs) migrateFoldersFromPaths(ctx context.Context) error {
 			FROM all_dirs
 			WHERE full_path != ''
 		)
-		INSERT INTO %s (media_key, file_name, path, type, user_name)
+		INSERT INTO %s (media_key, file_name, name, path, type, user_name)
 		SELECT
 			'folder:' || $1 || ':' || full_path,
 			folder_name,
+			'',
 			parent_path,
 			-1,
 			$1
@@ -423,7 +379,7 @@ func (f *Fs) InsertMediaItems(ctx context.Context, items []gphoto.MediaItem) err
 	query := fmt.Sprintf(`
 		INSERT INTO %s (`, f.opt.TableName)
 	query += `
-			media_key, file_name, dedup_key, is_canonical, type, caption, collection_id,
+			media_key, file_name, name, path, dedup_key, is_canonical, type, caption, collection_id,
 			size_bytes, quota_charged_bytes, origin, content_version, utc_timestamp,
 			server_creation_timestamp, timezone_offset, width, height, remote_url,
 			upload_status, trash_timestamp, is_archived, is_favorite, is_locked,
@@ -432,7 +388,7 @@ func (f *Fs) InsertMediaItems(ctx context.Context, items []gphoto.MediaItem) err
 			duration, capture_frame_rate, encoded_frame_rate, is_micro_video,
 			micro_video_width, micro_video_height, user_name
 		) VALUES (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+			$1, $2, '', '', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
 			$17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
 			$31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41
 		)
@@ -444,6 +400,7 @@ func (f *Fs) InsertMediaItems(ctx context.Context, items []gphoto.MediaItem) err
 			content_version = EXCLUDED.content_version,
 			-- Do NOT update utc_timestamp for existing files to keep modtime stable
 			-- This prevents stashapp from detecting "file changed" on VFS remount
+			-- Hide non-canonical files (exact copies) - trash_timestamp already computed in Go
 			trash_timestamp = EXCLUDED.trash_timestamp,
 			is_archived = EXCLUDED.is_archived,
 			is_favorite = EXCLUDED.is_favorite
@@ -456,12 +413,19 @@ func (f *Fs) InsertMediaItems(ctx context.Context, items []gphoto.MediaItem) err
 	defer stmt.Close()
 
 	for _, item := range items {
+		// Hide non-canonical files (exact copies) by setting trash_timestamp = -1
+		// This keeps them in the database but hides from listings
+		trashTimestamp := item.TrashTimestamp
+		if !item.IsCanonical && (item.TrashTimestamp == 0) {
+			trashTimestamp = -1
+		}
+
 		_, err = stmt.ExecContext(ctx,
 			item.MediaKey, item.FileName, item.DedupKey, item.IsCanonical, item.Type,
 			item.Caption, item.CollectionID, item.SizeBytes, item.QuotaChargedBytes,
 			item.Origin, item.ContentVersion, item.UTCTimestamp, item.ServerCreationTimestamp,
 			item.TimezoneOffset, item.Width, item.Height, item.RemoteURL, item.UploadStatus,
-			item.TrashTimestamp, item.IsArchived, item.IsFavorite, item.IsLocked,
+			trashTimestamp, item.IsArchived, item.IsFavorite, item.IsLocked,
 			item.IsOriginalQuality, item.Latitude, item.Longitude, item.LocationName,
 			item.LocationID, item.IsEdited, item.Make, item.Model, item.Aperture,
 			item.ShutterSpeed, item.ISO, item.FocalLength, item.Duration,

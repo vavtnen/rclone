@@ -594,7 +594,7 @@ func (c *Cache) removeNotInUse(item *Item, maxAge time.Duration, emptyOnly bool)
 	// The item will not be removed or reset the cache data is dirty (DataDirty)
 	c.used -= spaceFreed
 	if removed {
-		fs.Infof(c.fremote, "vfs cache RemoveNotInUse (maxAge=%d, emptyOnly=%v): item %s was removed, freed %d bytes", maxAge, emptyOnly, item.GetName(), spaceFreed)
+		fs.Debugf(c.fremote, "vfs cache RemoveNotInUse (maxAge=%d, emptyOnly=%v): item %s was removed, freed %d bytes", maxAge, emptyOnly, item.GetName(), spaceFreed)
 		// Remove the entry
 		delete(c.item, item.name)
 	} else {
@@ -831,7 +831,7 @@ func (c *Cache) clean(kicked bool) {
 
 	stats := fmt.Sprintf("objects %d (was %d) in use %d, to upload %d, uploading %d, total size %v (was %v)",
 		newItems, oldItems, totalInUse, uploadsQueued, uploadsInProgress, newUsed, oldUsed)
-	fs.Infof(c.fremote, "vfs cache: cleaned: %s", stats)
+	fs.Debugf(c.fremote, "vfs cache: cleaned: %s", stats)
 	if err = systemd.UpdateStatus(fmt.Sprintf("[%s] vfs cache: %s", time.Now().Format("15:04"), stats)); err != nil {
 		fs.Errorf(c.fremote, "vfs cache: updating systemd status with current stats failed: %s", err)
 	}

@@ -25,6 +25,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/cache"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -251,28 +252,24 @@ type Options struct {
 
 // Fs represents a connection to the media database
 type Fs struct {
-	name        string
-	root        string
-	opt         Options
-	features    *fs.Features
-	db          *sql.DB
-	dbConnStr   string // stored for lazy notify listener start
-	httpClient  *http.Client
-	api         *gphoto.API // Google Photos API client for download URLs
-	urlCache    *urlCache
+	name          string
+	root          string
+	opt           Options
+	features      *fs.Features
+	db            *sql.DB
+	dbConnStr     string // stored for lazy notify listener start
+	httpClient    *http.Client
+	api           *gphoto.API // Google Photos API client for download URLs
+	urlCache      *urlCache
 	urlFetchGroup singleflight.Group // Coalesces duplicate URL fetch requests
-	// lazyMeta stores metadata loaded asynchronously for large listings
-	lazyMeta map[string]*Object
-	lazyMu   sync.RWMutex
-	// prefetchedDirs tracks which directories have been prefetched for NewObject
-	prefetchedDirs map[string]bool
-	prefetchMu     sync.RWMutex
+	// objectCache stores Object metadata for fast NewObject lookups (replaces lazyMeta)
+	objectCache *cache.Cache
+	// prefetchCache tracks which directories have been prefetched for NewObject
+	prefetchCache *cache.Cache
 	// dirCache caches directory listings to avoid reloading on every change
-	dirCache map[string]*dirCacheEntry
-	dirMu    sync.RWMutex
-	// folderExistsCache tracks folders we've already created/verified in this session
-	folderExistsCache map[string]bool
-	folderCacheMu     sync.RWMutex
+	dirCache *cache.Cache
+	// folderCache tracks folders we've already created/verified in this session
+	folderCache *cache.Cache
 	// syncStop channel to stop background sync goroutine
 	syncStop chan struct{}
 	// bgCtx is a context for background operations that can be cancelled on shutdown
@@ -285,12 +282,6 @@ type Fs struct {
 	// Put operations wait for this before uploading
 	mountReady     chan struct{}
 	mountReadyOnce sync.Once
-}
-
-// dirCacheEntry represents a cached directory listing
-type dirCacheEntry struct {
-	entries   fs.DirEntries
-	expiresAt time.Time
 }
 
 // Object represents a media file in the database
@@ -321,6 +312,12 @@ func convertUnixTimestamp(timestamp int64) time.Time {
 	}
 	// Otherwise assume seconds
 	return time.Unix(timestamp, 0)
+}
+
+// normalizePath removes leading and trailing slashes from a path.
+// This ensures consistency with the database normalization done at startup.
+func normalizePath(p string) string {
+	return strings.Trim(p, "/")
 }
 
 // Name of the remote (as passed into NewFs)
@@ -445,17 +442,17 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		root:              root,
 		opt:               *opt,
 		db:                db,
-		dbConnStr:         dbConnStr, // store for lazy notify listener start
-		httpClient:        customClient,
-		urlCache:          newURLCache(),
-		lazyMeta:          make(map[string]*Object),
-		prefetchedDirs:    make(map[string]bool),
-		dirCache:          make(map[string]*dirCacheEntry),
-		folderExistsCache: make(map[string]bool),
-		syncStop:          make(chan struct{}),
-		bgCtx:             bgCtx,
-		bgCancel:          bgCancel,
-		mountReady:        make(chan struct{}),
+		dbConnStr:     dbConnStr, // store for lazy notify listener start
+		httpClient:    customClient,
+		urlCache:      newURLCache(),
+		objectCache:   cache.New().SetExpireDuration(time.Hour),           // Object metadata cache (1 hour)
+		prefetchCache: cache.New().SetExpireDuration(5 * time.Minute),     // Prefetch tracking (5 min)
+		dirCache:      cache.New().SetExpireDuration(dirCacheTTL),         // Directory listings (5 min)
+		folderCache:   cache.New().SetExpireDuration(0),                   // Folder existence (never expires, session-only)
+		syncStop:      make(chan struct{}),
+		bgCtx:      bgCtx,
+		bgCancel:   bgCancel,
+		mountReady: make(chan struct{}),
 	}
 
 	// Initialize Google Photos API client for download URLs
@@ -494,6 +491,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 
 	// Note: notifyListener is started lazily in ChangeNotify() - only for mount operations
+
+	// Start background deletion worker
+	go f.processDeleteQueue()
 
 	// Perform initial sync if needed
 	if opt.User != "" {
@@ -618,33 +618,21 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		cacheKey = "." // Use "." for root
 	}
 
-	f.dirMu.RLock()
-	if entry, ok := f.dirCache[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
-		f.dirMu.RUnlock()
-		fs.Debugf(f, "List cache hit for %s", dir)
-		return entry.entries, nil
-	}
-	f.dirMu.RUnlock()
-
-	// Cache miss or expired, load from database
-	// Use configured user for per-user mounts
-	var result fs.DirEntries
-	result, err = f.listUserFiles(ctx, f.opt.User, root)
-
+	// Use lib/cache Get with create function
+	value, err := f.dirCache.Get(cacheKey, func(key string) (any, bool, error) {
+		// Cache miss - load from database
+		result, err := f.listUserFiles(ctx, f.opt.User, root)
+		if err != nil {
+			return nil, false, err // Don't cache errors
+		}
+		fs.Debugf(f, "List cached %s with %d entries", dir, len(result))
+		return result, true, nil
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Cache the result with a long TTL (1 hour)
-	f.dirMu.Lock()
-	f.dirCache[cacheKey] = &dirCacheEntry{
-		entries:   result,
-		expiresAt: time.Now().Add(time.Hour),
-	}
-	f.dirMu.Unlock()
-
-	fs.Debugf(f, "List cached %s with %d entries", dir, len(result))
-	return result, nil
+	return value.(fs.DirEntries), nil
 }
 
 // listUsers is no longer needed - single user per database
@@ -656,25 +644,26 @@ func (f *Fs) listUserFiles(ctx context.Context, userName string, dirPath string)
 	// Normalize dirPath for comparison
 	dirPath = strings.Trim(dirPath, "/")
 
-	// Simple query: get all items where path = dirPath
-	// Folders have type = -1, files have type >= 0
-	// Exclude trashed items (trash_timestamp > 0)
-	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
-	// Trim trailing slashes from path for comparison
+	// Query using DISTINCT ON to deduplicate files with same display name
+	// Inner query: picks one row per display name (newest by utc_timestamp)
+	// Outer query: orders results for display (folders first, then by name)
+	// Paths are normalized at startup so we can use direct comparison
 	query := fmt.Sprintf(`
-		SELECT
-			media_key,
-			file_name,
-			COALESCE(name, '') as custom_name,
-			COALESCE(path, '') as custom_path,
-			COALESCE(type, 0) as item_type,
-			COALESCE(size_bytes, 0) as size_bytes,
-			COALESCE(utc_timestamp, 0) as utc_timestamp
-		FROM %s
-		WHERE user_name = $1 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2
-			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-			AND (is_canonical IS NULL OR is_canonical = true)
-		ORDER BY type ASC, file_name ASC
+		SELECT * FROM (
+			SELECT DISTINCT ON (user_name, path, COALESCE(NULLIF(name, ''), file_name))
+				media_key,
+				file_name,
+				name,
+				path,
+				COALESCE(type, 0) as item_type,
+				COALESCE(size_bytes, 0) as size_bytes,
+				COALESCE(utc_timestamp, 0) as utc_timestamp
+			FROM %s
+			WHERE user_name = $1 AND path = $2
+				AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+			ORDER BY user_name, path, COALESCE(NULLIF(name, ''), file_name), utc_timestamp DESC
+		) sub
+		ORDER BY item_type ASC, file_name ASC
 	`, f.opt.TableName)
 
 	rows, err := f.db.QueryContext(ctx, query, userName, dirPath)
@@ -753,19 +742,14 @@ func (f *Fs) listUserFiles(ctx context.Context, userName string, dirPath string)
 			}
 			entries = append(entries, obj)
 
-			// Store in lazyMeta cache so NewObject can find it without a DB query
-			f.lazyMu.Lock()
-			f.lazyMeta[remote] = obj
-			f.lazyMu.Unlock()
+			// Store in objectCache so NewObject can find it without a DB query
+			f.objectCache.Put(remote, obj)
 		}
 	}
 
 	if err = rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating files: %w", err)
 	}
-
-	// Note: lazyMeta is now populated directly in the loop above
-	// No need for background populateMetadata as it's redundant and causes high CPU
 
 	return entries, nil
 }
@@ -787,12 +771,9 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 
 	// Fast path: check if we've loaded metadata in cache
-	f.lazyMu.RLock()
-	if o, ok := f.lazyMeta[remote]; ok {
-		f.lazyMu.RUnlock()
-		return o, nil
+	if value, found := f.objectCache.GetMaybe(remote); found {
+		return value.(*Object), nil
 	}
-	f.lazyMu.RUnlock()
 
 	// Parse the path to get directory
 	var dirPath string
@@ -805,12 +786,10 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	// Check if we've already prefetched this directory
 	// The prefetch key is the full database path (not relative)
 	prefetchKey := dirPath
-	f.prefetchMu.RLock()
-	alreadyPrefetched := f.prefetchedDirs[prefetchKey]
-	f.prefetchMu.RUnlock()
+	_, alreadyPrefetched := f.prefetchCache.GetMaybe(prefetchKey)
 
 	if !alreadyPrefetched {
-		// Prefetch the entire directory - this populates lazyMeta for all files in the dir
+		// Prefetch the entire directory - this populates objectCache for all files in the dir
 		// This is much faster than individual queries when copying many files
 		_, err := f.listUserFiles(ctx, userName, dirPath)
 		if err != nil {
@@ -818,28 +797,25 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 		}
 
 		// Mark directory as prefetched
-		f.prefetchMu.Lock()
-		f.prefetchedDirs[prefetchKey] = true
-		f.prefetchMu.Unlock()
+		f.prefetchCache.Put(prefetchKey, true)
 
-		// Check lazyMeta again after prefetch
-		f.lazyMu.RLock()
-		if o, ok := f.lazyMeta[remote]; ok {
-			f.lazyMu.RUnlock()
-			return o, nil
+		// Check objectCache again after prefetch
+		if value, found := f.objectCache.GetMaybe(remote); found {
+			return value.(*Object), nil
 		}
-		f.lazyMu.RUnlock()
 	}
 
 	// Directory was prefetched but file not found - check if it's a folder
 	// This is a single query for the specific file/folder
-	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
+	// ORDER BY utc_timestamp DESC picks newest if duplicates exist (before unique constraint)
+	// Paths are normalized at startup, construct full path with CASE for root level
 	folderQuery := fmt.Sprintf(`
 		SELECT type FROM %s
 		WHERE user_name = $1
-			AND TRIM(BOTH '/' FROM COALESCE(path, '')) || '/' || TRIM(BOTH '/' FROM COALESCE(NULLIF(name, ''), file_name)) = $2
+			AND CASE WHEN path = '' THEN COALESCE(NULLIF(name, ''), file_name)
+			         ELSE path || '/' || COALESCE(NULLIF(name, ''), file_name) END = $2
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-			AND (is_canonical IS NULL OR is_canonical = true)
+		ORDER BY utc_timestamp DESC
 		LIMIT 1
 	`, f.opt.TableName)
 
@@ -857,20 +833,22 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 
 	// Fallback: file exists but wasn't in cache (shouldn't normally happen)
-	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
+	// ORDER BY utc_timestamp DESC picks newest if duplicates exist (before unique constraint)
+	// Paths are normalized at startup
 	query := fmt.Sprintf(`
 		SELECT
 			media_key,
 			file_name,
-			COALESCE(name, '') as custom_name,
-			COALESCE(path, '') as custom_path,
+			name,
+			path,
 			COALESCE(size_bytes, 0) as size_bytes,
 			COALESCE(utc_timestamp, 0) as utc_timestamp
 		FROM %s
 		WHERE user_name = $1
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-			AND (is_canonical IS NULL OR is_canonical = true)
-			AND TRIM(BOTH '/' FROM COALESCE(path, '')) || '/' || TRIM(BOTH '/' FROM COALESCE(NULLIF(name, ''), file_name)) = $2
+			AND CASE WHEN path = '' THEN COALESCE(NULLIF(name, ''), file_name)
+			         ELSE path || '/' || COALESCE(NULLIF(name, ''), file_name) END = $2
+		ORDER BY utc_timestamp DESC
 		LIMIT 1
 	`, f.opt.TableName)
 
@@ -911,9 +889,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 
 	// Cache for future lookups
-	f.lazyMu.Lock()
-	f.lazyMeta[remote] = obj
-	f.lazyMu.Unlock()
+	f.objectCache.Put(remote, obj)
 
 	return obj, nil
 }
@@ -924,10 +900,7 @@ func (f *Fs) invalidateDirCache(dirPath string) {
 	if cacheKey == "" {
 		cacheKey = "."
 	}
-
-	f.dirMu.Lock()
-	delete(f.dirCache, cacheKey)
-	f.dirMu.Unlock()
+	f.dirCache.Delete(cacheKey)
 }
 
 // removeFromDirCache removes a specific entry from a directory's cache
@@ -938,18 +911,19 @@ func (f *Fs) removeFromDirCache(dirPath string, entryName string) bool {
 		cacheKey = "."
 	}
 
-	f.dirMu.Lock()
-	defer f.dirMu.Unlock()
-
-	cached, exists := f.dirCache[cacheKey]
-	if !exists || len(cached.entries) == 0 {
+	value, found := f.dirCache.GetMaybe(cacheKey)
+	if !found {
+		return false
+	}
+	cached := value.(fs.DirEntries)
+	if len(cached) == 0 {
 		return false
 	}
 
 	// Find and remove the entry
-	newEntries := make(fs.DirEntries, 0, len(cached.entries))
-	found := false
-	for _, entry := range cached.entries {
+	newEntries := make(fs.DirEntries, 0, len(cached))
+	entryFound := false
+	for _, entry := range cached {
 		// Get the base name of the entry
 		baseName := entry.Remote()
 		if idx := strings.LastIndex(baseName, "/"); idx >= 0 {
@@ -958,17 +932,14 @@ func (f *Fs) removeFromDirCache(dirPath string, entryName string) bool {
 		if baseName != entryName {
 			newEntries = append(newEntries, entry)
 		} else {
-			found = true
+			entryFound = true
 		}
 	}
 
-	if found {
-		f.dirCache[cacheKey] = &dirCacheEntry{
-			entries:   newEntries,
-			expiresAt: cached.expiresAt,
-		}
+	if entryFound {
+		f.dirCache.Put(cacheKey, newEntries)
 	}
-	return found
+	return entryFound
 }
 
 // addToDirCache adds an entry to a directory's cache
@@ -979,19 +950,14 @@ func (f *Fs) addToDirCache(dirPath string, entry fs.DirEntry) {
 		cacheKey = "."
 	}
 
-	f.dirMu.Lock()
-	defer f.dirMu.Unlock()
-
-	cached, exists := f.dirCache[cacheKey]
-	if !exists {
+	value, found := f.dirCache.GetMaybe(cacheKey)
+	if !found {
 		return // Cache doesn't exist, will be populated on next list
 	}
+	cached := value.(fs.DirEntries)
 
 	// Add the entry to the cache
-	f.dirCache[cacheKey] = &dirCacheEntry{
-		entries:   append(cached.entries, entry),
-		expiresAt: cached.expiresAt,
-	}
+	f.dirCache.Put(cacheKey, append(cached, entry))
 }
 
 // ChangeNotify calls the passed function with a path that has had changes.
@@ -1163,8 +1129,9 @@ func (f *Fs) changeNotify(ctx context.Context, notify func(string, fs.EntryType)
 
 		case <-tickerChan:
 			// Query for rows newer than lastTimestamp
+			// Paths are normalized at startup
 			query := fmt.Sprintf(`
-				SELECT media_key, file_name, COALESCE(name, '') as custom_name, COALESCE(path, '') as custom_path, COALESCE(size_bytes, 0) as size_bytes, COALESCE(utc_timestamp, 0) as utc_timestamp
+				SELECT media_key, file_name, name, path, COALESCE(size_bytes, 0) as size_bytes, COALESCE(utc_timestamp, 0) as utc_timestamp
 				FROM %s
 				WHERE user_name = $1 AND utc_timestamp > $2
 				ORDER BY utc_timestamp
@@ -1299,12 +1266,12 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	// Parse path and name for database insert
 	// file_name = original filename only (no path)
 	// name = display name (same as file_name for uploads)
-	// path = directory path
+	// path = directory path (normalized - no leading/trailing slashes)
 	fileName := path.Base(src.Remote()) // Original filename only
 	var displayPath string
 	if strings.Contains(fullPath, "/") {
 		lastSlash := strings.LastIndex(fullPath, "/")
-		displayPath = fullPath[:lastSlash]
+		displayPath = normalizePath(fullPath[:lastSlash])
 	} else {
 		displayPath = ""
 	}
@@ -1378,56 +1345,69 @@ func (f *Fs) ensureFoldersExist(ctx context.Context, userName string, folderPath
 
 	// Check if this exact folder path is already cached
 	cacheKey := userName + ":" + folderPath
-	f.folderCacheMu.RLock()
-	if f.folderExistsCache[cacheKey] {
-		f.folderCacheMu.RUnlock()
+	if _, found := f.folderCache.GetMaybe(cacheKey); found {
 		return nil // Already verified/created
 	}
-	f.folderCacheMu.RUnlock()
 
+	// Build folder data in Go (faster than complex SQL CTE with REGEXP)
 	parts := strings.Split(folderPath, "/")
+	type folderData struct {
+		mediaKey   string
+		folderName string
+		parentPath string
+	}
+	folders := make([]folderData, len(parts))
 
-	// Build each level of the path and insert
-	parentPath := ""
+	currentPath := ""
 	for i, part := range parts {
-		// The full path of this folder (for media_key)
-		var fullPath string
 		if i == 0 {
-			fullPath = part
-		} else {
-			fullPath = parentPath + "/" + part
-		}
-
-		// Check cache for this specific folder level
-		levelCacheKey := userName + ":" + fullPath
-		f.folderCacheMu.RLock()
-		exists := f.folderExistsCache[levelCacheKey]
-		f.folderCacheMu.RUnlock()
-
-		if !exists {
-			mediaKey := fmt.Sprintf("folder:%s:%s", userName, fullPath)
-
-			// Insert folder if not exists (type = -1 for folders)
-			// path = parent's path, file_name = folder's name
-			query := fmt.Sprintf(`
-				INSERT INTO %s (media_key, file_name, path, type, user_name)
-				VALUES ($1, $2, $3, -1, $4)
-				ON CONFLICT (media_key) DO NOTHING
-			`, f.opt.TableName)
-
-			_, err := f.db.ExecContext(ctx, query, mediaKey, part, parentPath, userName)
-			if err != nil {
-				return fmt.Errorf("failed to create folder %s: %w", fullPath, err)
+			currentPath = part
+			folders[i] = folderData{
+				mediaKey:   fmt.Sprintf("folder:%s:%s", userName, currentPath),
+				folderName: part,
+				parentPath: "",
 			}
-
-			// Mark this folder as existing in cache
-			f.folderCacheMu.Lock()
-			f.folderExistsCache[levelCacheKey] = true
-			f.folderCacheMu.Unlock()
+		} else {
+			parentPath := currentPath
+			currentPath = currentPath + "/" + part
+			folders[i] = folderData{
+				mediaKey:   fmt.Sprintf("folder:%s:%s", userName, currentPath),
+				folderName: part,
+				parentPath: parentPath,
+			}
 		}
+	}
 
-		// Update parentPath for next iteration
-		parentPath = fullPath
+	// Single INSERT with multiple VALUES - much faster than CTE with REGEXP
+	query := fmt.Sprintf(`
+		INSERT INTO %s (media_key, file_name, name, path, type, user_name)
+		VALUES `, f.opt.TableName)
+
+	args := make([]interface{}, 0, len(folders)*4)
+	for i, fd := range folders {
+		if i > 0 {
+			query += ", "
+		}
+		paramBase := i * 4
+		query += fmt.Sprintf("($%d, $%d, '', $%d, -1, $%d)", paramBase+1, paramBase+2, paramBase+3, paramBase+4)
+		args = append(args, fd.mediaKey, fd.folderName, fd.parentPath, userName)
+	}
+	query += " ON CONFLICT (media_key) DO NOTHING"
+
+	_, err := f.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("failed to create folders for %s: %w", folderPath, err)
+	}
+
+	// Cache all folder levels
+	currentPath = ""
+	for i, part := range parts {
+		if i == 0 {
+			currentPath = part
+		} else {
+			currentPath = currentPath + "/" + part
+		}
+		f.folderCache.Put(userName+":"+currentPath, true)
 	}
 
 	return nil
@@ -1472,10 +1452,10 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	userName := f.opt.User
 
 	// Check if folder has any files (files have path = folderPath)
-	// Exclude trashed items, trim trailing slashes from path
+	// Exclude trashed items, paths are normalized at startup
 	checkFilesQuery := fmt.Sprintf(`
 		SELECT COUNT(*) FROM %s
-		WHERE user_name = $1 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2 AND type != -1
+		WHERE user_name = $1 AND path = $2 AND type != -1
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 	`, f.opt.TableName)
 
@@ -1490,10 +1470,10 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 
 	// Check for subfolders (subfolders have path = folderPath, type = -1)
-	// Exclude trashed items, trim trailing slashes from path
+	// Exclude trashed items, paths are normalized at startup
 	checkSubfoldersQuery := fmt.Sprintf(`
 		SELECT COUNT(*) FROM %s
-		WHERE user_name = $1 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2 AND type = -1
+		WHERE user_name = $1 AND path = $2 AND type = -1
 			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 	`, f.opt.TableName)
 
@@ -1508,7 +1488,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		hasVisibleSubfolderContent := false
 		subfolderQuery := fmt.Sprintf(`
 			SELECT media_key FROM %s
-			WHERE user_name = $1 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2 AND type = -1
+			WHERE user_name = $1 AND path = $2 AND type = -1
 				AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 		`, f.opt.TableName)
 		subRows, err := f.db.QueryContext(ctx, subfolderQuery, userName, folderPath)
@@ -1534,7 +1514,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 			// Check if this subfolder has any visible content
 			visibleQuery := fmt.Sprintf(`
 				SELECT COUNT(*) FROM %s
-				WHERE user_name = $1 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2
+				WHERE user_name = $1 AND path = $2
 					AND (trash_timestamp IS NULL OR trash_timestamp = 0)
 			`, f.opt.TableName)
 			var visibleCount int
@@ -1583,13 +1563,70 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 	f.removeFromDirCache(parentPath, folderName)
 
-	// Remove from folderExistsCache
+	// Remove from folderCache
 	cacheKey := userName + ":" + folderPath
-	f.folderCacheMu.Lock()
-	delete(f.folderExistsCache, cacheKey)
-	f.folderCacheMu.Unlock()
+	f.folderCache.Delete(cacheKey)
 
 	fs.Debugf(f, "mediavfs: removed directory: %s", folderPath)
+	return nil
+}
+
+// Purge deletes all files in the directory and the directory itself
+// This is much faster than deleting files one by one
+// Implements fs.Purger interface
+func (f *Fs) Purge(ctx context.Context, dir string) error {
+	// Get the full path
+	folderPath := strings.Trim(path.Join(f.root, dir), "/")
+	if folderPath == "" {
+		return fmt.Errorf("cannot purge root directory")
+	}
+
+	userName := f.opt.User
+
+	// Mark all files in this directory and subdirectories as trashed in DB
+	// Background process will handle actual Google deletion via periodic scan
+	updateQuery := fmt.Sprintf(`
+		UPDATE %s
+		SET trash_timestamp = -1, path = '', name = file_name
+		WHERE user_name = $1
+			AND (path = $2 OR path LIKE $2 || '/%%')
+			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+	`, f.opt.TableName)
+
+	result, err := f.db.ExecContext(ctx, updateQuery, userName, folderPath)
+	if err != nil {
+		return fmt.Errorf("failed to mark files as trashed: %w", err)
+	}
+
+	filesAffected, _ := result.RowsAffected()
+
+	// Delete all folder rows in this directory and subdirectories
+	deleteFoldersQuery := fmt.Sprintf(`
+		DELETE FROM %s
+		WHERE user_name = $1
+			AND type = -1
+			AND (
+				media_key = $2
+				OR media_key LIKE $3
+			)
+	`, f.opt.TableName)
+
+	folderMediaKey := fmt.Sprintf("folder:%s:%s", userName, folderPath)
+	folderMediaKeyPrefix := fmt.Sprintf("folder:%s:%s/%%", userName, folderPath)
+
+	result, err = f.db.ExecContext(ctx, deleteFoldersQuery, userName, folderMediaKey, folderMediaKeyPrefix)
+	if err != nil {
+		return fmt.Errorf("failed to delete folders: %w", err)
+	}
+
+	foldersAffected, _ := result.RowsAffected()
+
+	// Invalidate caches for this directory and all subdirectories
+	f.dirCache.DeletePrefix(userName + ":" + folderPath)
+	f.folderCache.DeletePrefix(userName + ":" + folderPath)
+
+	fs.Infof(f, "Purge: removed %s (%d files trashed, %d folders deleted)",
+		folderPath, filesAffected, foldersAffected)
 	return nil
 }
 
@@ -1654,17 +1691,13 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	// Add to destination directory cache
 	f.addToDirCache(newPath, newObj)
 
-	// Update lazyMeta cache - remove old path and add new path
-	f.lazyMu.Lock()
-	delete(f.lazyMeta, srcObj.remote)
-	f.lazyMeta[remote] = newObj
-	f.lazyMu.Unlock()
+	// Update objectCache - remove old path and add new path
+	f.objectCache.Delete(srcObj.remote)
+	f.objectCache.Put(remote, newObj)
 
 	// Invalidate prefetched dirs for both source and destination
-	f.prefetchMu.Lock()
-	delete(f.prefetchedDirs, srcObj.displayPath)
-	delete(f.prefetchedDirs, newPath)
-	f.prefetchMu.Unlock()
+	f.prefetchCache.Delete(srcObj.displayPath)
+	f.prefetchCache.Delete(newPath)
 
 	fs.Debugf(nil, "Move completed: %s -> %s", srcObj.remote, remote)
 
@@ -1678,8 +1711,6 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return fs.ErrorCantDirMove
 	}
 
-	// In single-user mode, use f.opt.User as the username
-	// The remote paths are just the directory paths without username prefix
 	userName := f.opt.User
 	srcPath := strings.Trim(srcRemote, "/")
 	dstPath := strings.Trim(dstRemote, "/")
@@ -1690,7 +1721,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 
 	fs.Debugf(nil, "DirMove: %s -> %s", srcPath, dstPath)
 
-	// Ensure destination parent folders exist
+	// Ensure destination parent folders exist (single CTE query)
 	if strings.Contains(dstPath, "/") {
 		parentPath := dstPath[:strings.LastIndex(dstPath, "/")]
 		if err := f.ensureFoldersExist(ctx, userName, parentPath); err != nil {
@@ -1698,76 +1729,55 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		}
 	}
 
-	// Get the new folder name (last component of dstPath)
+	// Get destination folder name and parent path
 	dstFolderName := dstPath
-	if strings.Contains(dstPath, "/") {
-		dstFolderName = dstPath[strings.LastIndex(dstPath, "/")+1:]
-	}
-
-	// Get the new parent path (for the folder row)
 	dstParentPath := ""
 	if strings.Contains(dstPath, "/") {
+		dstFolderName = dstPath[strings.LastIndex(dstPath, "/")+1:]
 		dstParentPath = dstPath[:strings.LastIndex(dstPath, "/")]
 	}
 
-	// Update the source folder row itself
-	srcMediaKey := fmt.Sprintf("folder:%s:%s", userName, srcPath)
-	dstMediaKey := fmt.Sprintf("folder:%s:%s", userName, dstPath)
+	// Single query to do all updates - combined path update handles both exact and prefix match
+	// SUBSTRING(path FROM LENGTH(src)+1) returns '' for exact match, '/rest' for prefix match
+	query := fmt.Sprintf(`
+		DO $$
+		DECLARE
+			src_path TEXT := '%s';
+			dst_path TEXT := '%s';
+			dst_name TEXT := '%s';
+			dst_parent TEXT := '%s';
+			uname TEXT := '%s';
+			src_key TEXT;
+			dst_key TEXT;
+		BEGIN
+			src_key := 'folder:' || uname || ':' || src_path;
+			dst_key := 'folder:' || uname || ':' || dst_path;
 
-	// Delete any existing folder at destination (in case of overwrite)
-	deleteQuery := fmt.Sprintf(`DELETE FROM %s WHERE media_key = $1`, f.opt.TableName)
-	_, _ = f.db.ExecContext(ctx, deleteQuery, dstMediaKey)
+			-- Delete existing folder at destination
+			DELETE FROM %s WHERE media_key = dst_key;
 
-	// Update source folder to destination
-	updateFolderQuery := fmt.Sprintf(`
-		UPDATE %s
-		SET media_key = $1, file_name = $2, path = $3
-		WHERE media_key = $4
-	`, f.opt.TableName)
+			-- Update source folder row
+			UPDATE %s SET media_key = dst_key, file_name = dst_name, path = dst_parent
+			WHERE media_key = src_key;
 
-	_, err := f.db.ExecContext(ctx, updateFolderQuery, dstMediaKey, dstFolderName, dstParentPath, srcMediaKey)
+			-- Update all items (files and subfolders) in one query
+			-- For path='a': SUBSTRING('a' FROM 2) = '' → dst_path
+			-- For path='a/b/c': SUBSTRING('a/b/c' FROM 2) = '/b/c' → dst_path || '/b/c'
+			UPDATE %s SET path = dst_path || SUBSTRING(path FROM LENGTH(src_path) + 1)
+			WHERE user_name = uname AND (path = src_path OR path LIKE src_path || '/%%');
+
+			-- Update subfolder media_keys
+			UPDATE %s SET media_key = 'folder:' || uname || ':' || path || '/' || file_name
+			WHERE user_name = uname AND type = -1
+				AND (path = dst_path OR path LIKE dst_path || '/%%')
+				AND (trash_timestamp IS NULL OR trash_timestamp = 0);
+		END $$;
+	`, srcPath, dstPath, dstFolderName, dstParentPath, userName,
+		f.opt.TableName, f.opt.TableName, f.opt.TableName, f.opt.TableName)
+
+	_, err := f.db.ExecContext(ctx, query)
 	if err != nil {
-		return fmt.Errorf("failed to move folder row: %w", err)
-	}
-
-	// Update all items (files and subfolders) that have path = srcPath
-	// Trim trailing slashes from path for comparison
-	query1 := fmt.Sprintf(`
-		UPDATE %s
-		SET path = $1
-		WHERE user_name = $2 AND TRIM(TRAILING '/' FROM COALESCE(path, '')) = $3
-	`, f.opt.TableName)
-
-	_, err = f.db.ExecContext(ctx, query1, dstPath, userName, srcPath)
-	if err != nil {
-		return fmt.Errorf("failed to move directory contents (exact match): %w", err)
-	}
-
-	// Update all items with path starting with srcPath/
-	srcPathPrefix := srcPath + "/"
-	query2 := fmt.Sprintf(`
-		UPDATE %s
-		SET path = $1 || SUBSTRING(path FROM $2)
-		WHERE user_name = $3 AND path LIKE $4
-	`, f.opt.TableName)
-
-	_, err = f.db.ExecContext(ctx, query2, dstPath, len(srcPath)+1, userName, srcPathPrefix+"%")
-	if err != nil {
-		return fmt.Errorf("failed to move directory contents (prefix match): %w", err)
-	}
-
-	// Update media_keys for subfolder rows
-	// Exclude trashed items
-	updateSubfolderKeysQuery := fmt.Sprintf(`
-		UPDATE %s
-		SET media_key = 'folder:' || $1 || ':' || path || '/' || file_name
-		WHERE user_name = $1 AND type = -1 AND (path = $2 OR path LIKE $3)
-			AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-	`, f.opt.TableName)
-
-	_, err = f.db.ExecContext(ctx, updateSubfolderKeysQuery, userName, dstPath, dstPath+"/%")
-	if err != nil {
-		return fmt.Errorf("failed to update subfolder keys: %w", err)
+		return fmt.Errorf("failed to move directory: %w", err)
 	}
 
 	// Invalidate caches for source and destination parent directories
@@ -1783,30 +1793,19 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	f.invalidateDirCache(srcPath)
 	f.invalidateDirCache(dstPath)
 
-	// Clear lazyMeta entries for all files in moved directory
-	f.lazyMu.Lock()
-	for key := range f.lazyMeta {
-		if key == srcPath || strings.HasPrefix(key, srcPath+"/") {
-			delete(f.lazyMeta, key)
-		}
-	}
-	f.lazyMu.Unlock()
+	// Clear objectCache entries for all files in moved directory using DeletePrefix
+	f.objectCache.Delete(srcPath)
+	f.objectCache.DeletePrefix(srcPath + "/")
 
-	// Clear prefetchedDirs for source and destination paths
-	f.prefetchMu.Lock()
-	for key := range f.prefetchedDirs {
-		if key == srcPath || strings.HasPrefix(key, srcPath+"/") ||
-			key == dstPath || strings.HasPrefix(key, dstPath+"/") {
-			delete(f.prefetchedDirs, key)
-		}
-	}
-	f.prefetchMu.Unlock()
+	// Clear prefetchCache for source and destination paths using DeletePrefix
+	f.prefetchCache.Delete(srcPath)
+	f.prefetchCache.DeletePrefix(srcPath + "/")
+	f.prefetchCache.Delete(dstPath)
+	f.prefetchCache.DeletePrefix(dstPath + "/")
 
-	// Update folderExistsCache - remove old path, add new path
-	f.folderCacheMu.Lock()
-	delete(f.folderExistsCache, userName+":"+srcPath)
-	f.folderExistsCache[userName+":"+dstPath] = true
-	f.folderCacheMu.Unlock()
+	// Update folderCache - remove old path, add new path
+	f.folderCache.Delete(userName + ":" + srcPath)
+	f.folderCache.Put(userName+":"+dstPath, true)
 
 	fs.Debugf(nil, "DirMove completed: %s -> %s", srcRemote, dstRemote)
 	return nil
@@ -1910,9 +1909,8 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 		if err != nil {
 			if errors.Is(err, gphoto.ErrMediaNotFound) {
 				fs.Errorf(o, "File not found in Google Photos: %s - marking as missing (trash_timestamp=-2)", o.remote)
-				// Set trash_timestamp = -2 and path = NULL to mark as missing/404
-				// path = NULL prevents duplicates if user uploads new file with same name and old file comes back
-				updateQuery := fmt.Sprintf(`UPDATE %s SET trash_timestamp = -2, path = NULL WHERE media_key = $1`, o.fs.opt.TableName)
+				// Set trash_timestamp = -2, path = '', name = file_name to mark as missing/404
+				updateQuery := fmt.Sprintf(`UPDATE %s SET trash_timestamp = -2, path = '', name = file_name WHERE media_key = $1`, o.fs.opt.TableName)
 				_, updateErr := o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
 				if updateErr != nil {
 					fs.Errorf(o, "Failed to mark missing media in database: %v", updateErr)
@@ -2058,9 +2056,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		}
 	}
 
-	// Log info message only for initial download, not for seeks
+	// Log debug message only for initial download, not for seeks
 	if !isRangeRequest {
-		fs.Infof(o, "Starting download: %s", o.remote)
+		fs.Debugf(o, "Starting download: %s", o.remote)
 	}
 
 	// Now make the actual GET request to the resolved URL with retry logic
@@ -2175,114 +2173,103 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	return fmt.Errorf("cannot update existing file (size differs: local=%d remote=%d) - delete and re-upload instead", src.Size(), o.size)
 }
 
-// Remove deletes a file - checks for duplicates first to prevent data loss
+// Remove deletes a file - processes deletion in background for fast response
 // If file has duplicates (same dedup_key), only hides locally (trash_timestamp = -1)
-// If file is unique, deletes from Google Photos server and database
+// If file is unique, deletes from Google Photos server in background
 func (o *Object) Remove(ctx context.Context) error {
 	if !o.fs.opt.EnableDelete {
 		fs.Debugf(o.fs, "Remove disabled for %s", o.Remote())
 		return nil
 	}
 
-	fs.Debugf(o.fs, "Checking duplicates before removing %s", o.Remote())
+	// Remove from caches immediately (fast response to OS)
+	o.fs.removeFromDirCache(o.displayPath, o.displayName)
+	o.fs.objectCache.Delete(o.remote)
 
-	// CRITICAL: Get file info and verify it exists at the expected path in the database
-	// This prevents data loss from stale cache entries (e.g., after Move)
-	// Combined query for better performance: gets path, name, dedup_key, and duplicate count
-	var dbPath, dbName, dedupKey string
-	var duplicateCount int
+	// Mark as trashed in DB immediately (fast - just an UPDATE)
+	// Background process will handle actual Google deletion via periodic DB scan
+	updateQuery := fmt.Sprintf(`
+		UPDATE %s SET trash_timestamp = -1, path = '', name = file_name
+		WHERE media_key = $1
+	`, o.fs.opt.TableName)
+	_, err := o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
+	if err != nil {
+		return fmt.Errorf("failed to mark for deletion: %w", err)
+	}
+
+	fs.Debugf(o.fs, "Marked %s for deletion (trash_timestamp=-1)", o.Remote())
+	return nil
+}
+
+// processDeleteQueue periodically scans DB for pending deletions and processes them
+func (f *Fs) processDeleteQueue() {
+	// Ticker for periodic DB scan (every 30 seconds)
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-f.bgCtx.Done():
+			fs.Debugf(f, "Background deletion worker stopped")
+			return
+		case <-ticker.C:
+			f.processPendingDeletions()
+		}
+	}
+}
+
+// processPendingDeletions scans DB for ONE item with trash_timestamp = -1 and deletes from Google
+// Processes only one dedup_key per cycle to avoid rate limiting and spread load over time
+func (f *Fs) processPendingDeletions() {
+	ctx, cancel := context.WithTimeout(f.bgCtx, 30*time.Second)
+	defer cancel()
+
+	// Find ONE dedup_key where ALL copies are locally deleted (trash_timestamp = -1)
+	// LIMIT 1 ensures we only process one deletion per cycle
 	query := fmt.Sprintf(`
-		SELECT
-			COALESCE(m.path, '') as path,
-			COALESCE(NULLIF(m.name, ''), m.file_name) as name,
-			COALESCE(m.dedup_key, '') as dedup_key,
-			CASE
-				WHEN m.dedup_key IS NULL OR m.dedup_key = '' THEN 1
-				ELSE (
-					SELECT COUNT(*) FROM %s
-					WHERE dedup_key = m.dedup_key
-					AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-				)
-			END as duplicate_count
+		SELECT DISTINCT dedup_key, user_name
 		FROM %s m
-		WHERE m.media_key = $1
-		AND (m.trash_timestamp IS NULL OR m.trash_timestamp = 0)
-	`, o.fs.opt.TableName, o.fs.opt.TableName)
-	err := o.fs.db.QueryRowContext(ctx, query, o.mediaKey).Scan(&dbPath, &dbName, &dedupKey, &duplicateCount)
+		WHERE trash_timestamp = -1
+			AND dedup_key IS NOT NULL
+			AND dedup_key != ''
+			AND NOT EXISTS (
+				SELECT 1 FROM %s other
+				WHERE other.dedup_key = m.dedup_key
+					AND other.user_name = m.user_name
+					AND (other.trash_timestamp IS NULL OR other.trash_timestamp >= 0)
+			)
+		LIMIT 1
+	`, f.opt.TableName, f.opt.TableName)
+
+	var dedupKey, userName string
+	err := f.db.QueryRowContext(ctx, query).Scan(&dedupKey, &userName)
 	if err == sql.ErrNoRows {
-		// File doesn't exist in database - this is a stale cache entry
-		fs.Errorf(o.fs, "CRITICAL: Remove called on stale cache entry %s (media_key=%s not found in database) - refusing to delete", o.Remote(), o.mediaKey)
-		// Clear the stale cache entry
-		o.fs.lazyMu.Lock()
-		delete(o.fs.lazyMeta, o.remote)
-		o.fs.lazyMu.Unlock()
-		o.fs.removeFromDirCache(o.displayPath, o.displayName)
-		return fs.ErrorObjectNotFound
+		return // No pending deletions
 	}
 	if err != nil {
-		return fmt.Errorf("failed to get file info: %w", err)
+		fs.Errorf(f, "Failed to query pending deletion: %v", err)
+		return
 	}
 
-	// Verify the path matches what we expect
-	expectedPath := strings.Trim(o.displayPath+"/"+o.displayName, "/")
-	actualPath := strings.Trim(dbPath+"/"+dbName, "/")
-	if expectedPath != actualPath {
-		fs.Errorf(o.fs, "CRITICAL: Remove path mismatch - cache has %s but database has %s (media_key=%s) - refusing to delete to prevent data loss", expectedPath, actualPath, o.mediaKey)
-		// Clear the stale cache entry
-		o.fs.lazyMu.Lock()
-		delete(o.fs.lazyMeta, o.remote)
-		o.fs.lazyMu.Unlock()
-		o.fs.removeFromDirCache(o.displayPath, o.displayName)
-		return fs.ErrorObjectNotFound
+	// Delete from Google Photos
+	if err := f.DeleteFromGPhotos(ctx, []string{dedupKey}, userName); err != nil {
+		fs.Errorf(f, "Failed to delete %s from Google Photos: %v", dedupKey, err)
+		return
 	}
 
-	// Remove from caches
-	o.fs.removeFromDirCache(o.displayPath, o.displayName)
-	o.fs.lazyMu.Lock()
-	delete(o.fs.lazyMeta, o.remote)
-	o.fs.lazyMu.Unlock()
+	// After successful Google deletion, remove all copies with this dedup_key from DB
+	deleteQuery := fmt.Sprintf(`
+		DELETE FROM %s
+		WHERE dedup_key = $1 AND user_name = $2 AND trash_timestamp = -1
+	`, f.opt.TableName)
 
-	if duplicateCount <= 1 {
-		// This is the only copy - safe to delete from Google Photos
-		fs.Debugf(o.fs, "File %s is unique (no duplicates), deleting from Google Photos", o.Remote())
-
-		if dedupKey != "" {
-			// Delete from Google Photos
-			if err := o.fs.DeleteFromGPhotos(ctx, []string{dedupKey}, o.userName); err != nil {
-				fs.Errorf(o.fs, "Failed to delete from Google Photos: %v", err)
-				// Still mark as deleted locally even if Google delete fails
-			}
-		}
-
-		// Delete from database
-		deleteQuery := fmt.Sprintf(`DELETE FROM %s WHERE media_key = $1`, o.fs.opt.TableName)
-		_, err = o.fs.db.ExecContext(ctx, deleteQuery, o.mediaKey)
-		if err != nil {
-			return fmt.Errorf("failed to delete from database: %w", err)
-		}
-
-		fs.Infof(o.fs, "Deleted %s from Google Photos and database", o.Remote())
+	result, err := f.db.ExecContext(ctx, deleteQuery, dedupKey, userName)
+	if err != nil {
+		fs.Errorf(f, "Failed to delete %s from DB: %v", dedupKey, err)
 	} else {
-		// Multiple copies exist - only hide locally to prevent data loss
-		fs.Debugf(o.fs, "File %s has %d copies, hiding locally only (not deleting from Google Photos)", o.Remote(), duplicateCount)
-
-		// Mark for local deletion by setting trash_timestamp = -1 and path = NULL
-		// Setting path = NULL ensures the file doesn't appear in parent directory listings,
-		// allowing parent folders to be removed without "folder not empty" errors
-		updateQuery := fmt.Sprintf(`
-			UPDATE %s SET trash_timestamp = -1, path = NULL
-			WHERE media_key = $1
-		`, o.fs.opt.TableName)
-
-		_, err = o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
-		if err != nil {
-			return fmt.Errorf("failed to mark for deletion: %w", err)
-		}
-
-		fs.Infof(o.fs, "Hidden %s locally (has %d duplicates, not deleted from Google Photos)", o.Remote(), duplicateCount)
+		affected, _ := result.RowsAffected()
+		fs.Debugf(f, "Deleted %s from Google Photos and removed %d DB entries", dedupKey, affected)
 	}
-
-	return nil
 }
 
 // startBackgroundSync starts a goroutine that performs periodic syncs
@@ -2313,12 +2300,8 @@ func (f *Fs) startBackgroundSync() {
 			case <-f.syncStop:
 				return
 			case <-ticker.C:
-				// Note: We intentionally do NOT process pending deletions here.
-				// Files marked with trash_timestamp = -1 are hidden locally only.
-				// We don't delete from Google Photos to prevent data loss
-				// (deleting one file might remove all duplicates).
-
 				// Sync from Google Photos with timeout
+				// Note: Pending deletions are processed by processDeleteQueue goroutine
 				syncCtx, cancel := context.WithTimeout(f.bgCtx, syncPageTimeout)
 				if err := f.SyncFromGooglePhotos(syncCtx, f.opt.User); err != nil {
 					if f.bgCtx.Err() != nil {
@@ -2360,47 +2343,54 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 	// Query ALL files and folders recursively under rootPath
 	// Files have path starting with rootPath (or equal to rootPath)
 	// This is a single query that gets everything
-	// Only show canonical files (is_canonical = true or NULL for backwards compatibility)
+	// Uses DISTINCT ON to deduplicate files with same display name in same path
 	var query string
 	var rows *sql.Rows
 	var err error
 
 	if rootPath == "" {
 		// List everything for this user
+		// Inner query: DISTINCT ON picks newest file per (path, display_name)
+		// Outer query: orders for display
 		query = fmt.Sprintf(`
-			SELECT
-				media_key,
-				file_name,
-				COALESCE(name, '') as custom_name,
-				COALESCE(path, '') as custom_path,
-				COALESCE(type, 0) as item_type,
-				COALESCE(size_bytes, 0) as size_bytes,
-				COALESCE(utc_timestamp, 0) as utc_timestamp
-			FROM %s
-			WHERE user_name = $1
-				AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-				AND (is_canonical IS NULL OR is_canonical = true)
-			ORDER BY path, type ASC, file_name ASC
+			SELECT * FROM (
+				SELECT DISTINCT ON (user_name, path, COALESCE(NULLIF(name, ''), file_name))
+					media_key,
+					file_name,
+					name,
+					path,
+					COALESCE(type, 0) as item_type,
+					COALESCE(size_bytes, 0) as size_bytes,
+					COALESCE(utc_timestamp, 0) as utc_timestamp
+				FROM %s
+				WHERE user_name = $1
+					AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+				ORDER BY user_name, path, COALESCE(NULLIF(name, ''), file_name), utc_timestamp DESC
+			) sub
+			ORDER BY path, item_type ASC, file_name ASC
 		`, f.opt.TableName)
 		rows, err = f.db.QueryContext(ctx, query, userName)
 	} else {
 		// List everything under rootPath (path = rootPath OR path starts with rootPath/)
+		// Inner query: DISTINCT ON picks newest file per (path, display_name)
+		// Outer query: orders for display
 		query = fmt.Sprintf(`
-			SELECT
-				media_key,
-				file_name,
-				COALESCE(name, '') as custom_name,
-				COALESCE(path, '') as custom_path,
-				COALESCE(type, 0) as item_type,
-				COALESCE(size_bytes, 0) as size_bytes,
-				COALESCE(utc_timestamp, 0) as utc_timestamp
-			FROM %s
-			WHERE user_name = $1
-				AND (TRIM(TRAILING '/' FROM COALESCE(path, '')) = $2
-				     OR COALESCE(path, '') LIKE $3)
-				AND (trash_timestamp IS NULL OR trash_timestamp = 0)
-				AND (is_canonical IS NULL OR is_canonical = true)
-			ORDER BY path, type ASC, file_name ASC
+			SELECT * FROM (
+				SELECT DISTINCT ON (user_name, path, COALESCE(NULLIF(name, ''), file_name))
+					media_key,
+					file_name,
+					name,
+					path,
+					COALESCE(type, 0) as item_type,
+					COALESCE(size_bytes, 0) as size_bytes,
+					COALESCE(utc_timestamp, 0) as utc_timestamp
+				FROM %s
+				WHERE user_name = $1
+					AND (path = $2 OR path LIKE $3)
+					AND (trash_timestamp IS NULL OR trash_timestamp = 0)
+				ORDER BY user_name, path, COALESCE(NULLIF(name, ''), file_name), utc_timestamp DESC
+			) sub
+			ORDER BY path, item_type ASC, file_name ASC
 		`, f.opt.TableName)
 		rows, err = f.db.QueryContext(ctx, query, userName, rootPath, rootPath+"/%")
 	}
@@ -2496,10 +2486,8 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 			}
 			entries = append(entries, obj)
 
-			// Store in lazyMeta cache for fast NewObject lookups
-			f.lazyMu.Lock()
-			f.lazyMeta[remote] = obj
-			f.lazyMu.Unlock()
+			// Store in objectCache for fast NewObject lookups
+			f.objectCache.Put(remote, obj)
 		}
 
 		// Send batch to callback when we reach batchSize
@@ -2533,6 +2521,7 @@ var (
 	_ fs.Fs         = (*Fs)(nil)
 	_ fs.Object     = (*Object)(nil)
 	_ fs.Mover      = (*Fs)(nil)
+	_ fs.Purger     = (*Fs)(nil)
 	_ fs.Shutdowner = (*Fs)(nil)
 	_ fs.ListRer    = (*Fs)(nil)
 )
