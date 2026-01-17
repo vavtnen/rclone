@@ -72,6 +72,12 @@ func (f *Fs) InitializeDatabase(ctx context.Context) error {
 	`, f.opt.TableName)
 	_, _ = f.db.ExecContext(ctx, alterQuery) // Ignore error if column exists
 
+	// Add unsupported_video_url column for storing download URLs for unsupported videos
+	alterQuery2 := fmt.Sprintf(`
+		ALTER TABLE %s ADD COLUMN IF NOT EXISTS unsupported_video_url TEXT
+	`, f.opt.TableName)
+	_, _ = f.db.ExecContext(ctx, alterQuery2) // Ignore error if column exists
+
 	// Create state table for tracking sync progress (one row per user)
 	// Matches Python schema - no last_sync_time column
 	_, err = f.db.ExecContext(ctx, `
