@@ -1757,6 +1757,10 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 
 	// Single query to do all updates - combined path update handles both exact and prefix match
 	// SUBSTRING(path FROM LENGTH(src)+1) returns '' for exact match, '/rest' for prefix match
+	// Escape single quotes in paths for SQL string literals (replace ' with '')
+	escapeSQLString := func(s string) string {
+		return strings.ReplaceAll(s, "'", "''")
+	}
 	query := fmt.Sprintf(`
 		DO $$
 		DECLARE
@@ -1790,7 +1794,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 				AND (path = dst_path OR path LIKE dst_path || '/%%')
 				AND (trash_timestamp IS NULL OR trash_timestamp = 0);
 		END $$;
-	`, srcPath, dstPath, dstFolderName, dstParentPath, userName,
+	`, escapeSQLString(srcPath), escapeSQLString(dstPath), escapeSQLString(dstFolderName), escapeSQLString(dstParentPath), escapeSQLString(userName),
 		f.opt.TableName, f.opt.TableName, f.opt.TableName, f.opt.TableName)
 
 	_, err := f.db.ExecContext(ctx, query)
