@@ -1172,6 +1172,25 @@ func parseUnsupportedVideoItem(data interface{}) (UnsupportedVideoItem, error) {
 		return UnsupportedVideoItem{}, fmt.Errorf("invalid item format: expected array with 7 elements")
 	}
 
+	// Log the raw array to debug the structure
+	fs.Infof(nil, "parseUnsupportedVideoItem: array length=%d", len(arr))
+	for i, v := range arr {
+		switch val := v.(type) {
+		case string:
+			if len(val) > 100 {
+				fs.Infof(nil, "  [%d] string (len=%d): %s...", i, len(val), val[:100])
+			} else {
+				fs.Infof(nil, "  [%d] string: %s", i, val)
+			}
+		case float64:
+			fs.Infof(nil, "  [%d] float64: %v", i, val)
+		case nil:
+			fs.Infof(nil, "  [%d] nil", i)
+		default:
+			fs.Infof(nil, "  [%d] %T: %v", i, v, v)
+		}
+	}
+
 	item := UnsupportedVideoItem{}
 
 	// Index 0: media key
