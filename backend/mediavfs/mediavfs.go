@@ -1918,10 +1918,25 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 				}
 				if unsupportedURL != "" {
 					fs.Infof(o, "Using unsupported video download URL for %s", o.remote)
-					// The unsupported video URL is a direct download URL
+
+					// Do a HEAD request to get ETag for proper range request support
+					var etag string
+					headReq, headErr := http.NewRequestWithContext(ctx, "HEAD", unsupportedURL, nil)
+					if headErr == nil {
+						headReq.Header.Set("User-Agent", gphoto.WebUserAgent)
+						headResp, respErr := o.fs.httpClient.Do(headReq)
+						if respErr == nil {
+							if headResp.StatusCode == http.StatusOK {
+								etag = headResp.Header.Get("ETag")
+								fs.Debugf(o, "Got ETag for unsupported video: %s", etag)
+							}
+							headResp.Body.Close()
+						}
+					}
+
 					meta := &urlMetadata{
 						resolvedURL: unsupportedURL,
-						etag:        "", // No ETag for unsupported videos
+						etag:        etag,
 						size:        o.size,
 						expiresAt:   time.Now().Add(50 * time.Minute), // Shorter TTL for unsupported videos
 						lastAccess:  time.Now(),
@@ -2175,7 +2190,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		return nil, fmt.Errorf("failed to download %s: %w", o.remote, getErr)
 	}
 
-	fs.Debugf(o, "Download started: %s (%d bytes)", o.remote, fileSize)
+	// Log response status to verify range request support
+	if res.StatusCode == http.StatusPartialContent {
+		fs.Debugf(o, "Download started (206 Partial Content): %s range %d-%d", o.remote, rangeStart, rangeEnd)
+	} else {
+		fs.Debugf(o, "Download started (200 OK - no range support): %s requested %d-%d but got full file", o.remote, rangeStart, rangeEnd)
+	}
 
 	return res.Body, nil
 }
