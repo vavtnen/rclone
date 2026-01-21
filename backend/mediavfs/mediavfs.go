@@ -2014,12 +2014,15 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 
 		resolvedURL := headResp.Request.URL.String()
 		etag := headResp.Header.Get("ETag")
+		acceptRanges := headResp.Header.Get("Accept-Ranges")
 		var fileSize int64
 		if contentLength := headResp.Header.Get("Content-Length"); contentLength != "" {
 			fmt.Sscanf(contentLength, "%d", &fileSize)
 		} else {
 			fileSize = o.size
 		}
+
+		fs.Infof(o, "HEAD response: URL=%s ETag=%q Accept-Ranges=%s Content-Length=%d", resolvedURL, etag, acceptRanges, fileSize)
 
 		// Cache the metadata
 		meta := &urlMetadata{
