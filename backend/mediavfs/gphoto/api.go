@@ -935,31 +935,100 @@ func generateSAPISIDHash(sapisid, origin string) string {
 	return fmt.Sprintf("%d_%x", timestamp, hash)
 }
 
+// getATToken fetches the SNlM0e token from the unsupported videos page
+// This token is required for batchexecute API calls
+func (api *API) getATToken(ctx context.Context, session *WebSession) (string, error) {
+	origin := "https://photos.google.com"
+	pageURL := origin + "/unsupportedvideos"
+
+	req, err := http.NewRequestWithContext(ctx, "GET", pageURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("User-Agent", WebUserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Authorization", "SAPISIDHASH "+generateSAPISIDHash(session.SAPISID, origin))
+	req.Header.Set("Cookie", session.CookieString())
+
+	resp, err := api.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch page: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	bodyStr := string(body)
+
+	// Check if we're logged in
+	if strings.Contains(bodyStr, "AccountsSignInUi") {
+		return "", ErrCookiesExpired
+	}
+
+	// Extract SNlM0e token using regex
+	// Pattern: "SNlM0e":"<token>"
+	idx := strings.Index(bodyStr, `"SNlM0e":"`)
+	if idx == -1 {
+		return "", fmt.Errorf("SNlM0e token not found in page")
+	}
+
+	start := idx + len(`"SNlM0e":"`)
+	end := strings.Index(bodyStr[start:], `"`)
+	if end == -1 {
+		return "", fmt.Errorf("SNlM0e token end not found")
+	}
+
+	token := bodyStr[start : start+end]
+	fs.Debugf(nil, "gphoto: got AT token: %s...", token[:min(30, len(token))])
+	return token, nil
+}
+
 // GetUnsupportedVideos fetches the list of unsupported videos using the batchexecute API
 // This requires web session cookies (SAPISID, SID) which can be obtained from a browser session
 // Returns ErrCookiesMissing if cookies are not configured, ErrCookiesExpired if cookies have expired
 func (api *API) GetUnsupportedVideos(ctx context.Context, session *WebSession, pageToken string) ([]UnsupportedVideoItem, string, error) {
+	return api.GetUnsupportedVideosWithToken(ctx, session, pageToken, "")
+}
+
+// GetUnsupportedVideosWithToken fetches unsupported videos with an optional pre-fetched AT token
+func (api *API) GetUnsupportedVideosWithToken(ctx context.Context, session *WebSession, pageToken, atToken string) ([]UnsupportedVideoItem, string, error) {
 	if session == nil || session.SAPISID == "" || session.SID == "" {
 		return nil, "", ErrCookiesMissing
+	}
+
+	// Get AT token if not provided
+	if atToken == "" {
+		var err error
+		atToken, err = api.getATToken(ctx, session)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to get AT token: %w", err)
+		}
 	}
 
 	origin := "https://photos.google.com"
 	sapisidhash := generateSAPISIDHash(session.SAPISID, origin)
 
 	// Build the f.req parameter for TLvKMb RPC
-	// Format: [[["TLvKMb","[\"pageToken\"]",null,"generic"]]]
+	// Format: [[["TLvKMb","[pageToken,null]",null,"generic"]]]
+	// Must match Python: "[null,null]" for first page, "[\"token\",null]" for pagination
 	var innerReq string
 	if pageToken == "" {
-		innerReq = "[]"
+		innerReq = "[null,null]"
 	} else {
-		innerReq = fmt.Sprintf("[\"%s\"]", pageToken)
+		// JSON encode the page token with null second element
+		innerReq = fmt.Sprintf(`["%s",null]`, pageToken)
 	}
 
 	freqData := fmt.Sprintf(`[[["TLvKMb",%q,null,"generic"]]]`, innerReq)
 
-	// URL encode the request
+	// URL encode the request - must include "at" token
 	formData := url.Values{
 		"f.req": {freqData},
+		"at":    {atToken},
 	}
 
 	reqURL := "https://photos.google.com/_/PhotosUi/data/batchexecute?rpcids=TLvKMb&source-path=%2Funsupportedvideos&hl=en&soc-app=165&soc-platform=1&soc-device=1"
