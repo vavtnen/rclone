@@ -935,22 +935,10 @@ func (api *API) getATToken(ctx context.Context, session *WebSession) (string, er
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Set headers exactly as Python does
 	req.Header.Set("User-Agent", WebUserAgent)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-
-	// Generate SAPISIDHASH
-	sapisidhash := generateSAPISIDHash(session.SAPISID, origin)
-	req.Header.Set("Authorization", "SAPISIDHASH "+sapisidhash)
-
-	// Set cookies
-	cookieStr := session.CookieString()
-	req.Header.Set("Cookie", cookieStr)
-
-	// Debug logging
-	fs.Infof(nil, "gphoto: fetching AT token from %s", pageURL)
-	fs.Infof(nil, "gphoto: Authorization: SAPISIDHASH %s", sapisidhash)
-	fs.Infof(nil, "gphoto: Cookie length: %d chars", len(cookieStr))
+	req.Header.Set("Authorization", "SAPISIDHASH "+generateSAPISIDHash(session.SAPISID, origin))
+	req.Header.Set("Cookie", session.CookieString())
 
 	resp, err := api.httpClient.Do(req)
 	if err != nil {
@@ -958,36 +946,21 @@ func (api *API) getATToken(ctx context.Context, session *WebSession) (string, er
 	}
 	defer resp.Body.Close()
 
-	fs.Infof(nil, "gphoto: page response status: %d", resp.StatusCode)
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}
 
 	bodyStr := string(body)
-	fs.Infof(nil, "gphoto: page response length: %d", len(bodyStr))
-
-	// Log first 1000 chars to see what we got
-	logLen := min(1000, len(bodyStr))
-	fs.Infof(nil, "gphoto: page response (first %d chars): %s", logLen, bodyStr[:logLen])
 
 	// Check if we're logged in
 	if strings.Contains(bodyStr, "AccountsSignInUi") {
-		fs.Infof(nil, "gphoto: found AccountsSignInUi - got login page instead of photos page")
 		return "", ErrCookiesExpired
 	}
 
-	// Check for PhotosUi to confirm we're on the right page
-	if strings.Contains(bodyStr, "PhotosUi") {
-		fs.Infof(nil, "gphoto: found PhotosUi - authenticated successfully!")
-	}
-
-	// Extract SNlM0e token
-	// Pattern: "SNlM0e":"<token>"
+	// Extract SNlM0e token - Pattern: "SNlM0e":"<token>"
 	idx := strings.Index(bodyStr, `"SNlM0e":"`)
 	if idx == -1 {
-		fs.Infof(nil, "gphoto: SNlM0e token not found in page")
 		return "", fmt.Errorf("SNlM0e token not found in page")
 	}
 
@@ -998,7 +971,7 @@ func (api *API) getATToken(ctx context.Context, session *WebSession) (string, er
 	}
 
 	token := bodyStr[start : start+end]
-	fs.Infof(nil, "gphoto: got AT token: %s...", token[:min(30, len(token))])
+	fs.Debugf(nil, "gphoto: got AT token")
 	return token, nil
 }
 
@@ -1088,14 +1061,6 @@ func (api *API) GetUnsupportedVideosWithToken(ctx context.Context, session *WebS
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to read response: %w", err)
-	}
-
-	// Log response for debugging
-	bodyStr := string(body)
-	if len(bodyStr) > 2000 {
-		fs.Infof(nil, "gphoto: batchexecute response (first 2000 chars): %s", bodyStr[:2000])
-	} else {
-		fs.Infof(nil, "gphoto: batchexecute response: %s", bodyStr)
 	}
 
 	return parseBatchExecuteUnsupportedVideos(body)
