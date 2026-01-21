@@ -7,8 +7,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import List, Optional
 
-# Cookies should be provided via environment variable or command line
-# Example: SAPISID=xxx; OSID=xxx; SID=xxx; ...
+# Testing phase - set cookies here when needed
 COOKIES = ""
 
 def parse_cookies(cookie_str):
@@ -310,41 +309,14 @@ def validate_videos(videos: List[UnsupportedVideo]) -> bool:
 
 
 if __name__ == "__main__":
-    import sys
-    import os
+    # For testing, parse from file
+    filepath = "unsupportedvideos.txt"
+    print(f"Parsing from file: {filepath}")
+    page_token, videos = parse_from_file(filepath)
 
-    # Check if we should parse from file or fetch live
-    if len(sys.argv) > 1 and sys.argv[1] == "--from-file":
-        filepath = sys.argv[2] if len(sys.argv) > 2 else "unsupportedvideos.txt"
-        print(f"Parsing from file: {filepath}")
-        page_token, videos = parse_from_file(filepath)
-
-        if videos:
-            print(f"\nPage token: {page_token[:50] if page_token else 'None'}...")
-            print_video_info(videos, show_urls=False)
-            validate_videos(videos)
-        else:
-            print("No videos found in response!")
+    if videos:
+        print(f"\nPage token: {page_token[:50] if page_token else 'None'}...")
+        print_video_info(videos, show_urls=False)
+        validate_videos(videos)
     else:
-        # Fetch live - get cookies from env or command line
-        cookies = os.environ.get("GOOGLE_PHOTOS_COOKIES", "")
-        if len(sys.argv) > 1:
-            cookies = sys.argv[1]
-
-        if not cookies:
-            print("Error: No cookies provided.")
-            print("Usage:")
-            print("  python unsupportedvideos.py --from-file [filepath]  # Parse from saved response")
-            print("  python unsupportedvideos.py <cookies>               # Fetch live with cookies")
-            print("  GOOGLE_PHOTOS_COOKIES=<cookies> python unsupportedvideos.py")
-            sys.exit(1)
-
-        response = fetch_unsupported_videos(cookies)
-        if response:
-            page_token, videos = parse_batchexecute_response(response)
-            if videos:
-                print(f"\nPage token: {page_token[:50] if page_token else 'None'}...")
-                print_video_info(videos, show_urls=False)
-                validate_videos(videos)
-            else:
-                print("No videos found in response!")
+        print("No videos found in response!")
