@@ -1919,25 +1919,65 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 				if unsupportedURL != "" {
 					fs.Infof(o, "Using unsupported video download URL for %s", o.remote)
 
-					// Do a HEAD request to get ETag for proper range request support
+					// Do a HEAD request to resolve URL (follow redirects) and get ETag
+					// This matches the normal file HEAD request flow
+					var resolvedURL string = unsupportedURL
 					var etag string
-					headReq, headErr := http.NewRequestWithContext(ctx, "HEAD", unsupportedURL, nil)
-					if headErr == nil {
+					var fileSize int64 = o.size
+
+					for attempt := 0; attempt < 3; attempt++ {
+						if attempt > 0 {
+							sleepTime := time.Duration(1<<uint(attempt-1)) * time.Second
+							fs.Debugf(o, "Retrying HEAD for unsupported video %s after %v (attempt %d/3)", o.remote, sleepTime, attempt+1)
+							time.Sleep(sleepTime)
+						}
+
+						headReq, headErr := http.NewRequestWithContext(ctx, "HEAD", unsupportedURL, nil)
+						if headErr != nil {
+							fs.Debugf(o, "Failed to create HEAD request for unsupported video: %v", headErr)
+							break
+						}
 						headReq.Header.Set("User-Agent", gphoto.WebUserAgent)
+
 						headResp, respErr := o.fs.httpClient.Do(headReq)
-						if respErr == nil {
-							if headResp.StatusCode == http.StatusOK {
-								etag = headResp.Header.Get("ETag")
-								fs.Infof(o, "Got ETag for unsupported video: %s", etag)
+						if respErr != nil {
+							fs.Debugf(o, "HEAD request failed for unsupported video: %v", respErr)
+							continue
+						}
+
+						if headResp.StatusCode == http.StatusOK {
+							// Get the resolved URL after any redirects
+							resolvedURL = headResp.Request.URL.String()
+							etag = headResp.Header.Get("ETag")
+							if contentLength := headResp.Header.Get("Content-Length"); contentLength != "" {
+								fmt.Sscanf(contentLength, "%d", &fileSize)
 							}
+							fs.Infof(o, "Resolved unsupported video URL, ETag: %s, Size: %d", etag, fileSize)
 							headResp.Body.Close()
+							break
+						} else if headResp.StatusCode == http.StatusTooManyRequests {
+							retryAfter := headResp.Header.Get("Retry-After")
+							waitTime := time.Duration(1<<uint(attempt)) * time.Second
+							if retryAfter != "" {
+								if seconds, parseErr := strconv.Atoi(retryAfter); parseErr == nil {
+									waitTime = time.Duration(seconds) * time.Second
+								}
+							}
+							fs.Infof(o, "Rate limited (429) for unsupported video %s, waiting %v", o.remote, waitTime)
+							headResp.Body.Close()
+							time.Sleep(waitTime)
+							continue
+						} else {
+							fs.Debugf(o, "HEAD request for unsupported video returned %d", headResp.StatusCode)
+							headResp.Body.Close()
+							break
 						}
 					}
 
 					meta := &urlMetadata{
-						resolvedURL: unsupportedURL,
+						resolvedURL: resolvedURL,
 						etag:        etag,
-						size:        o.size,
+						size:        fileSize,
 						expiresAt:   time.Now().Add(50 * time.Minute), // Shorter TTL for unsupported videos
 						lastAccess:  time.Now(),
 					}
