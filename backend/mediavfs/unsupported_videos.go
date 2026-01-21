@@ -98,20 +98,27 @@ func (f *Fs) UpsertUnsupportedVideos(ctx context.Context, videos []gphoto.Unsupp
 			mediaType = 99 // Use a special type for VTT metadata files
 		}
 
+		// Log thumbnail URL to investigate streaming URL possibility
+		if video.ThumbnailURL != "" {
+			fs.Debugf(nil, "Unsupported video %s thumbnail: %s", video.FileName, video.ThumbnailURL)
+		}
+
 		// Insert or update the video entry
 		// - Use media_key as the unique identifier
 		// - Store download URL in remote_url column
+		// - Store thumbnail URL in unsupported_video_url column for potential streaming URL conversion
 		// - Set trash_timestamp = 0 to make it visible
 		// - Place files in "Unsupported Videos" folder
 		query := fmt.Sprintf(`
 			INSERT INTO %s (
 				media_key, file_name, name, path, size_bytes, utc_timestamp,
-				remote_url, trash_timestamp, type, user_name
-			) VALUES ($1, $2, '', 'Unsupported Videos', $3, $4, $5, 0, $6, $7)
+				remote_url, unsupported_video_url, trash_timestamp, type, user_name
+			) VALUES ($1, $2, '', 'Unsupported Videos', $3, $4, $5, $6, 0, $7, $8)
 			ON CONFLICT (media_key) DO UPDATE SET
 				file_name = EXCLUDED.file_name,
 				size_bytes = EXCLUDED.size_bytes,
 				remote_url = EXCLUDED.remote_url,
+				unsupported_video_url = EXCLUDED.unsupported_video_url,
 				trash_timestamp = 0
 		`, f.opt.TableName)
 
@@ -121,6 +128,7 @@ func (f *Fs) UpsertUnsupportedVideos(ctx context.Context, videos []gphoto.Unsupp
 			video.Size,
 			video.Timestamp/1000, // Convert ms to seconds
 			video.DownloadURL,
+			video.ThumbnailURL, // Store thumbnail URL for potential streaming URL conversion
 			mediaType,
 			f.opt.User,
 		)

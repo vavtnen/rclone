@@ -2605,6 +2605,52 @@ func (f *Fs) GetUnsupportedVideoURL(ctx context.Context, mediaKey string) (strin
 	return downloadURL, nil
 }
 
+// GetUnsupportedVideoThumbnailURL retrieves the thumbnail URL for an unsupported video
+// This can potentially be converted to a streaming URL that supports range requests
+func (f *Fs) GetUnsupportedVideoThumbnailURL(ctx context.Context, mediaKey string) (string, error) {
+	// The thumbnail URL is stored in unsupported_video_url column for unsupported videos
+	// (We repurposed this column to store thumbnail URLs for streaming URL conversion)
+	query := fmt.Sprintf(`
+		SELECT unsupported_video_url
+		FROM %s
+		WHERE media_key = $1 AND user_name = $2 AND path = 'Unsupported Videos' AND unsupported_video_url IS NOT NULL AND unsupported_video_url != ''
+	`, f.opt.TableName)
+
+	var thumbnailURL string
+	err := f.db.QueryRowContext(ctx, query, mediaKey, f.opt.User).Scan(&thumbnailURL)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+
+	return thumbnailURL, nil
+}
+
+// ThumbnailToStreamingURL converts a Google Photos thumbnail URL to a streaming URL
+// that may support HTTP range requests
+// Input: https://lh3.googleusercontent.com/[hash]=s256 (thumbnail)
+// Output: https://lh3.googleusercontent.com/[hash]=m37 (original quality video)
+// Returns empty string if the URL is not in the expected format
+func ThumbnailToStreamingURL(thumbnailURL string) string {
+	// Check if it's an lh3 URL
+	if !strings.Contains(thumbnailURL, "lh3.googleusercontent.com/") {
+		return ""
+	}
+
+	// Find the = parameter
+	eqIdx := strings.LastIndex(thumbnailURL, "=")
+	if eqIdx == -1 {
+		// No parameter, just add =m37
+		return thumbnailURL + "=m37"
+	}
+
+	// Replace the parameter with =m37 for original quality
+	// Also try =m22 for 720p, =m18 for 480p as fallbacks
+	return thumbnailURL[:eqIdx] + "=m37"
+}
+
 // Check the interfaces are satisfied
 var (
 	_ fs.Fs         = (*Fs)(nil)
