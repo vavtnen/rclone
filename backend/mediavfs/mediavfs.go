@@ -2101,8 +2101,13 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			return nil, fmt.Errorf("failed to create request for %s: %w", o.remote, err)
 		}
 
-		// Set User-Agent header
-		req.Header.Set("User-Agent", "AndroidDownloadManager/13")
+		// Set User-Agent header - use browser User-Agent for unsupported video URLs
+		// as they require browser authentication context for proper streaming support
+		if strings.Contains(resolvedURL, "video-downloads.googleusercontent.com") {
+			req.Header.Set("User-Agent", gphoto.WebUserAgent)
+		} else {
+			req.Header.Set("User-Agent", "AndroidDownloadManager/13")
+		}
 
 		// Add If-Range header with ETag if we have it
 		if etag != "" {
@@ -2499,7 +2504,7 @@ func (f *Fs) GetWebSession() *gphoto.WebSession {
 func (f *Fs) SyncUnsupportedVideos(ctx context.Context) (int, error) {
 	session := f.GetWebSession()
 	if session == nil {
-		return 0, fmt.Errorf("web session cookies not configured (set web_sapisid, web_sid, web_hsid, web_ssid)")
+		return 0, fmt.Errorf("web session cookies not configured (set web_cookies)")
 	}
 
 	fs.Infof(f, "Starting unsupported videos sync...")

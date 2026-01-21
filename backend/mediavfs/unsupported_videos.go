@@ -150,7 +150,7 @@ func (f *Fs) SyncUnsupportedVideosNew(ctx context.Context) error {
 
 	// Validate minimum required cookies
 	if session.SAPISID == "" || session.SID == "" {
-		fs.Debugf(f, "Required web cookies (web_sapisid, web_sid) not configured, skipping unsupported videos sync")
+		fs.Debugf(f, "Required cookies (SAPISID, SID) not found in web_cookies, skipping unsupported videos sync")
 		return nil
 	}
 
@@ -169,11 +169,11 @@ func (f *Fs) SyncUnsupportedVideosNew(ctx context.Context) error {
 		if err != nil {
 			// Check for specific error types and notify user appropriately
 			if errors.Is(err, gphoto.ErrCookiesExpired) {
-				fs.Errorf(f, "Web session cookies have expired. Please update your cookies in rclone config (web_sapisid, web_sid, etc.) to continue syncing unsupported videos.")
+				fs.Errorf(f, "Web session cookies have expired. Please update web_cookies in rclone config to continue syncing unsupported videos.")
 				return fmt.Errorf("cookies expired: %w", err)
 			}
 			if errors.Is(err, gphoto.ErrCookiesMissing) {
-				fs.Infof(f, "Web cookies not fully configured. To sync unsupported videos, set web_sapisid and web_sid in rclone config.")
+				fs.Infof(f, "Web cookies not fully configured. Set web_cookies in rclone config to sync unsupported videos.")
 				return nil // Not an error, just skip this optional feature
 			}
 			return fmt.Errorf("failed to fetch page %d: %w", pageNum, err)

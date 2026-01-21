@@ -30,7 +30,7 @@ var ErrMediaNotFound = errors.New("media item not found")
 var ErrCookiesExpired = errors.New("web session cookies have expired - please provide new cookies")
 
 // ErrCookiesMissing is returned when required cookies are not configured
-var ErrCookiesMissing = errors.New("web cookies not configured - set web_sapisid and web_sid to use unsupported videos feature")
+var ErrCookiesMissing = errors.New("web cookies not configured - set web_cookies in rclone config to use unsupported videos feature")
 
 // Request counter for debugging rate limits
 var apiRequestCount int64
