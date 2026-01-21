@@ -2174,6 +2174,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			req.Header.Set(k, v)
 		}
 
+		// Log request details for debugging range request issues
+		fs.Infof(o, "GET request: URL=%s ETag=%q Range=%s", resolvedURL, etag, req.Header.Get("Range"))
+
 		// Execute the request
 		res, getErr = o.fs.httpClient.Do(req)
 		if getErr == nil {
@@ -2231,10 +2234,13 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	// Log response status to verify range request support
+	acceptRanges := res.Header.Get("Accept-Ranges")
+	contentRange := res.Header.Get("Content-Range")
+	contentLength := res.Header.Get("Content-Length")
 	if res.StatusCode == http.StatusPartialContent {
-		fs.Infof(o, "Download started (206 Partial Content): %s range %d-%d", o.remote, rangeStart, rangeEnd)
+		fs.Infof(o, "Download started (206 Partial Content): %s range %d-%d, Content-Range: %s", o.remote, rangeStart, rangeEnd, contentRange)
 	} else {
-		fs.Infof(o, "Download started (200 OK - no range support): %s requested %d-%d but got full file", o.remote, rangeStart, rangeEnd)
+		fs.Infof(o, "Download started (200 OK - no range support): %s requested %d-%d, Accept-Ranges: %s, Content-Length: %s", o.remote, rangeStart, rangeEnd, acceptRanges, contentLength)
 	}
 
 	return res.Body, nil
