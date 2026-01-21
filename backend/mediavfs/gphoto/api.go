@@ -1006,6 +1006,14 @@ func (api *API) GetUnsupportedVideos(ctx context.Context, session *WebSession, p
 		return nil, "", fmt.Errorf("failed to read response: %w", err)
 	}
 
+	// Log response for debugging
+	bodyStr := string(body)
+	if len(bodyStr) > 2000 {
+		fs.Infof(nil, "gphoto: batchexecute response (first 2000 chars): %s", bodyStr[:2000])
+	} else {
+		fs.Infof(nil, "gphoto: batchexecute response: %s", bodyStr)
+	}
+
 	return parseBatchExecuteUnsupportedVideos(body)
 }
 
