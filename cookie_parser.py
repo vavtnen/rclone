@@ -6,16 +6,12 @@ This script parses browser cookies and outputs them in rclone config format
 for the mediavfs unsupported videos feature.
 
 Usage:
-    1. Copy cookies from browser (as string or from exported file)
-    2. Run: python cookie_parser.py "cookie_string_here"
+    1. Run: python cookie_parser.py
+    2. Paste your cookies when prompted
     3. Copy output to rclone config
-
-Or paste cookies interactively:
-    python cookie_parser.py
 """
 
 import sys
-import re
 
 
 # Mapping of browser cookie names to rclone config option names
@@ -33,7 +29,7 @@ COOKIE_TO_CONFIG = {
 }
 
 # Required cookies for the API to work
-REQUIRED_COOKIES = ['SAPISID', 'SID', 'HSID', 'SSID']
+REQUIRED_COOKIES = ['SAPISID', 'SID']
 
 
 def parse_cookies(cookie_str: str) -> dict:
@@ -68,15 +64,11 @@ def cookies_to_rclone_config(cookies: dict) -> str:
 
 
 def main():
-    if len(sys.argv) > 1:
-        # Cookie string provided as argument
-        cookie_str = sys.argv[1]
-    else:
-        # Read from stdin
-        print("Paste your cookies (from browser, one line, then press Enter):", file=sys.stderr)
-        print("(You can get cookies from browser DevTools > Application > Cookies)", file=sys.stderr)
-        print("", file=sys.stderr)
-        cookie_str = input()
+    print("Paste your cookies (from browser, one line, then press Enter):", file=sys.stderr)
+    print("(Get cookies from browser DevTools > Application > Cookies > photos.google.com)", file=sys.stderr)
+    print("", file=sys.stderr)
+
+    cookie_str = input()
 
     cookies = parse_cookies(cookie_str)
 
