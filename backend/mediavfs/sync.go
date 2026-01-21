@@ -93,6 +93,20 @@ func (f *Fs) InitializeDatabase(ctx context.Context) error {
 		return fmt.Errorf("failed to create state table: %w", err)
 	}
 
+	// Create unsupported_videos_state table for tracking unsupported videos sync
+	_, err = f.db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS unsupported_videos_state (
+			id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+			user_name TEXT UNIQUE,
+			page_token TEXT,
+			sync_complete BOOLEAN DEFAULT FALSE,
+			last_sync BIGINT
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create unsupported_videos_state table: %w", err)
+	}
+
 	// Create indices for better performance
 	indexQuery := fmt.Sprintf(`
 		CREATE INDEX IF NOT EXISTS idx_%s_file_name ON %s(file_name);

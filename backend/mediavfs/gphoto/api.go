@@ -5,7 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/sha256"
+	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -870,11 +870,52 @@ type UnsupportedVideoItem struct {
 
 // WebSession holds web session cookies needed for batchexecute API
 type WebSession struct {
-	SAPISID string
-	SID     string
-	HSID    string
-	SSID    string
-	OSID    string
+	SAPISID   string
+	SID       string
+	HSID      string
+	SSID      string
+	OSID      string
+	PSID1     string // __Secure-1PSID
+	PSID3     string // __Secure-3PSID
+	APISID    string
+	PAPISID1  string // __Secure-1PAPISID
+	PAPISID3  string // __Secure-3PAPISID
+}
+
+// CookieString builds the cookie header string for HTTP requests
+func (s *WebSession) CookieString() string {
+	cookies := []string{}
+	if s.SAPISID != "" {
+		cookies = append(cookies, "SAPISID="+s.SAPISID)
+	}
+	if s.SID != "" {
+		cookies = append(cookies, "SID="+s.SID)
+	}
+	if s.HSID != "" {
+		cookies = append(cookies, "HSID="+s.HSID)
+	}
+	if s.SSID != "" {
+		cookies = append(cookies, "SSID="+s.SSID)
+	}
+	if s.OSID != "" {
+		cookies = append(cookies, "OSID="+s.OSID)
+	}
+	if s.PSID1 != "" {
+		cookies = append(cookies, "__Secure-1PSID="+s.PSID1)
+	}
+	if s.PSID3 != "" {
+		cookies = append(cookies, "__Secure-3PSID="+s.PSID3)
+	}
+	if s.APISID != "" {
+		cookies = append(cookies, "APISID="+s.APISID)
+	}
+	if s.PAPISID1 != "" {
+		cookies = append(cookies, "__Secure-1PAPISID="+s.PAPISID1)
+	}
+	if s.PAPISID3 != "" {
+		cookies = append(cookies, "__Secure-3PAPISID="+s.PAPISID3)
+	}
+	return strings.Join(cookies, "; ")
 }
 
 // generateSAPISIDHash generates the SAPISIDHASH for web authentication
@@ -882,7 +923,7 @@ type WebSession struct {
 func generateSAPISIDHash(sapisid, origin string) string {
 	timestamp := time.Now().Unix()
 	toHash := fmt.Sprintf("%d %s %s", timestamp, sapisid, origin)
-	hash := sha256.Sum256([]byte(toHash))
+	hash := sha1.Sum([]byte(toHash))
 	return fmt.Sprintf("%d_%x", timestamp, hash)
 }
 
@@ -927,13 +968,8 @@ func (api *API) GetUnsupportedVideos(ctx context.Context, session *WebSession, p
 	req.Header.Set("X-Same-Domain", "1")
 	req.Header.Set("Authorization", "SAPISIDHASH "+sapisidhash)
 
-	// Set cookies
-	cookies := fmt.Sprintf("SAPISID=%s; SID=%s; HSID=%s; SSID=%s",
-		session.SAPISID, session.SID, session.HSID, session.SSID)
-	if session.OSID != "" {
-		cookies += fmt.Sprintf("; OSID=%s", session.OSID)
-	}
-	req.Header.Set("Cookie", cookies)
+	// Set cookies using CookieString which includes all configured cookies
+	req.Header.Set("Cookie", session.CookieString())
 
 	resp, err := api.httpClient.Do(req)
 	if err != nil {

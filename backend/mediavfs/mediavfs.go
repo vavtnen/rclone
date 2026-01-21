@@ -230,7 +230,7 @@ func init() {
 			Advanced: true,
 		}, {
 			Name:     "web_sapisid",
-			Help:     "SAPISID cookie from browser session for unsupported videos API.\n\nRequired for downloading unsupported videos. Get from browser dev tools.",
+			Help:     "SAPISID cookie from browser session for unsupported videos API.\n\nRequired for downloading unsupported videos. Get from browser dev tools.\nUse cookie_parser.py to convert browser cookies to rclone config format.",
 			Advanced: true,
 		}, {
 			Name:     "web_sid",
@@ -243,6 +243,30 @@ func init() {
 		}, {
 			Name:     "web_ssid",
 			Help:     "SSID cookie from browser session for unsupported videos API.",
+			Advanced: true,
+		}, {
+			Name:     "web_osid",
+			Help:     "OSID cookie from browser session for unsupported videos API.",
+			Advanced: true,
+		}, {
+			Name:     "web_1psid",
+			Help:     "__Secure-1PSID cookie from browser session for unsupported videos API.",
+			Advanced: true,
+		}, {
+			Name:     "web_3psid",
+			Help:     "__Secure-3PSID cookie from browser session for unsupported videos API.",
+			Advanced: true,
+		}, {
+			Name:     "web_apisid",
+			Help:     "APISID cookie from browser session for unsupported videos API.",
+			Advanced: true,
+		}, {
+			Name:     "web_1papisid",
+			Help:     "__Secure-1PAPISID cookie from browser session for unsupported videos API.",
+			Advanced: true,
+		}, {
+			Name:     "web_3papisid",
+			Help:     "__Secure-3PAPISID cookie from browser session for unsupported videos API.",
 			Advanced: true,
 		}},
 	}
@@ -265,10 +289,16 @@ type Options struct {
 	AutoSync       bool   `config:"auto_sync"`
 	SyncInterval   int    `config:"sync_interval"`
 	// Web session cookies for unsupported videos API
-	WebSAPISID string `config:"web_sapisid"`
-	WebSID     string `config:"web_sid"`
-	WebHSID    string `config:"web_hsid"`
-	WebSSID    string `config:"web_ssid"`
+	WebSAPISID  string `config:"web_sapisid"`
+	WebSID      string `config:"web_sid"`
+	WebHSID     string `config:"web_hsid"`
+	WebSSID     string `config:"web_ssid"`
+	WebOSID     string `config:"web_osid"`
+	Web1PSID    string `config:"web_1psid"`
+	Web3PSID    string `config:"web_3psid"`
+	WebAPISID   string `config:"web_apisid"`
+	Web1PAPISID string `config:"web_1papisid"`
+	Web3PAPISID string `config:"web_3papisid"`
 }
 
 // Fs represents a connection to the media database
@@ -2250,6 +2280,15 @@ func (f *Fs) startBackgroundSync() {
 		}
 		cancel()
 
+		// Also sync unsupported videos on startup if web cookies are configured
+		if f.GetWebSession() != nil {
+			syncCtx, cancel = context.WithTimeout(f.bgCtx, syncPageTimeout)
+			if err := f.SyncUnsupportedVideosNew(syncCtx); err != nil {
+				fs.Errorf(f, "Initial unsupported videos sync failed: %v", err)
+			}
+			cancel()
+		}
+
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -2271,6 +2310,22 @@ func (f *Fs) startBackgroundSync() {
 					fs.Errorf(f, "Background sync failed: %v", err)
 				}
 				cancel()
+
+				// Sync unsupported videos (once per hour, not every interval)
+				// Check if enough time has passed since last sync
+				if f.GetWebSession() != nil {
+					state, err := f.GetUnsupportedVideosState(f.bgCtx)
+					if err == nil {
+						// Re-sync unsupported videos if more than 1 hour since last sync
+						if time.Now().Unix()-state.LastSync > 3600 {
+							syncCtx, cancel = context.WithTimeout(f.bgCtx, syncPageTimeout)
+							if err := f.SyncUnsupportedVideosNew(syncCtx); err != nil {
+								fs.Errorf(f, "Unsupported videos sync failed: %v", err)
+							}
+							cancel()
+						}
+					}
+				}
 			}
 		}
 	}()
@@ -2482,10 +2537,16 @@ func (f *Fs) GetWebSession() *gphoto.WebSession {
 		return nil
 	}
 	return &gphoto.WebSession{
-		SAPISID: f.opt.WebSAPISID,
-		SID:     f.opt.WebSID,
-		HSID:    f.opt.WebHSID,
-		SSID:    f.opt.WebSSID,
+		SAPISID:  f.opt.WebSAPISID,
+		SID:      f.opt.WebSID,
+		HSID:     f.opt.WebHSID,
+		SSID:     f.opt.WebSSID,
+		OSID:     f.opt.WebOSID,
+		PSID1:    f.opt.Web1PSID,
+		PSID3:    f.opt.Web3PSID,
+		APISID:   f.opt.WebAPISID,
+		PAPISID1: f.opt.Web1PAPISID,
+		PAPISID3: f.opt.Web3PAPISID,
 	}
 }
 
@@ -2558,15 +2619,30 @@ func (f *Fs) storeUnsupportedVideoURL(ctx context.Context, mediaKey, downloadURL
 }
 
 // GetUnsupportedVideoURL retrieves the stored download URL for an unsupported video
+// Checks both the legacy unsupported_video_url column and the remote_url column for files
+// in the "Unsupported Videos" folder
 func (f *Fs) GetUnsupportedVideoURL(ctx context.Context, mediaKey string) (string, error) {
+	// First check for videos in "Unsupported Videos" folder (uses remote_url)
 	query := fmt.Sprintf(`
-		SELECT unsupported_video_url
+		SELECT remote_url
 		FROM %s
-		WHERE media_key = $1 AND user_name = $2 AND unsupported_video_url IS NOT NULL
+		WHERE media_key = $1 AND user_name = $2 AND path = 'Unsupported Videos' AND remote_url IS NOT NULL AND remote_url != ''
 	`, f.opt.TableName)
 
 	var downloadURL string
 	err := f.db.QueryRowContext(ctx, query, mediaKey, f.opt.User).Scan(&downloadURL)
+	if err == nil && downloadURL != "" {
+		return downloadURL, nil
+	}
+
+	// Fallback to legacy unsupported_video_url column
+	query = fmt.Sprintf(`
+		SELECT unsupported_video_url
+		FROM %s
+		WHERE media_key = $1 AND user_name = $2 AND unsupported_video_url IS NOT NULL AND unsupported_video_url != ''
+	`, f.opt.TableName)
+
+	err = f.db.QueryRowContext(ctx, query, mediaKey, f.opt.User).Scan(&downloadURL)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return "", nil
