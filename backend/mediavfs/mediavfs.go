@@ -1928,7 +1928,9 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 					if updateErr != nil {
 						fs.Errorf(o, "Failed to mark missing media in database: %v", updateErr)
 					} else {
+						// Invalidate both caches to remove file from listings
 						o.fs.removeFromDirCache(o.displayPath, o.displayName)
+						o.fs.objectCache.Delete(o.remote)
 					}
 					return nil, fs.ErrorObjectNotFound
 				}
@@ -1994,7 +1996,9 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 					if updateErr != nil {
 						fs.Errorf(o, "Failed to mark missing media in database: %v", updateErr)
 					} else {
+						// Invalidate both caches to remove file from listings
 						o.fs.removeFromDirCache(o.displayPath, o.displayName)
+						o.fs.objectCache.Delete(o.remote)
 					}
 					return nil, fs.ErrorObjectNotFound
 				}
