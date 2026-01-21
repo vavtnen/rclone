@@ -52,29 +52,48 @@ def get_at_token(session, cookies_dict, sapisid):
     
     return None
 
-def fetch_unsupported_videos(cookies_str):
+def fetch_unsupported_videos(cookies_str, page_token: Optional[str] = None, session=None, at_token=None):
+    """
+    Fetch unsupported videos from Google Photos.
+
+    Args:
+        cookies_str: Cookie string for authentication
+        page_token: Optional page token for pagination
+        session: Optional existing session to reuse
+        at_token: Optional existing at token to reuse
+
+    Returns:
+        tuple: (response_text, session, at_token) for reuse in pagination
+    """
     cookies_dict = parse_cookies(cookies_str)
     sapisid = cookies_dict.get('SAPISID')
-    
+
     if not sapisid:
         print("Error: SAPISID not found")
-        return None
-    
-    session = requests.Session()
-    
-    # Get fresh at token
-    at_token = get_at_token(session, cookies_dict, sapisid)
-    if not at_token:
-        print("Error: Could not get at token")
-        return None
-    
-    print(f"Got at token: {at_token[:30]}...")
-    
+        return None, None, None
+
+    if session is None:
+        session = requests.Session()
+
+    # Get fresh at token if not provided
+    if at_token is None:
+        at_token = get_at_token(session, cookies_dict, sapisid)
+        if not at_token:
+            print("Error: Could not get at token")
+            return None, None, None
+        print(f"Got at token: {at_token[:30]}...")
+
     url = "https://photos.google.com/_/PhotosUi/data/batchexecute"
-    
-    # Try different request formats
-    rpc_data = [[["TLvKMb","[null,null]",None,"generic"]]]
-    
+
+    # Build the RPC data with optional page token
+    # Format: [page_token, null] for pagination, [null, null] for first page
+    if page_token:
+        inner_params = json.dumps([page_token, None])
+    else:
+        inner_params = "[null,null]"
+
+    rpc_data = [[["TLvKMb", inner_params, None, "generic"]]]
+
     headers = {
         "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
         "Authorization": generate_sapisidhash(sapisid),
@@ -83,15 +102,64 @@ def fetch_unsupported_videos(cookies_str):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "X-Same-Domain": "1",
     }
-    
+
     f_req = json.dumps(rpc_data)
     data = {"f.req": f_req, "at": at_token}
-    
+
     resp = session.post(url, headers=headers, cookies=cookies_dict, data=data)
     print(f"Batchexecute status: {resp.status_code}")
-    print(f"Response: {resp.text[:1000] if resp.text else 'empty'}")
-    
-    return resp.text
+
+    return resp.text, session, at_token
+
+
+def fetch_all_unsupported_videos(cookies_str) -> List["UnsupportedVideo"]:
+    """
+    Fetch all unsupported videos from Google Photos, handling pagination.
+
+    Returns:
+        List of all UnsupportedVideo objects
+    """
+    all_videos = []
+    page_num = 1
+    page_token = None
+    session = None
+    at_token = None
+
+    while True:
+        print(f"\n--- Fetching page {page_num} ---")
+
+        response_text, session, at_token = fetch_unsupported_videos(
+            cookies_str,
+            page_token=page_token,
+            session=session,
+            at_token=at_token
+        )
+
+        if not response_text:
+            print("Error: No response")
+            break
+
+        next_page_token, videos = parse_batchexecute_response(response_text)
+
+        if not videos:
+            print("No more videos found")
+            break
+
+        all_videos.extend(videos)
+        print(f"Got {len(videos)} entries (total: {len(all_videos)})")
+
+        # Check if there's a next page
+        if not next_page_token:
+            print("No more pages")
+            break
+
+        page_token = next_page_token
+        page_num += 1
+
+        # Small delay to avoid rate limiting
+        time.sleep(0.5)
+
+    return all_videos
 
 
 @dataclass
@@ -308,15 +376,58 @@ def validate_videos(videos: List[UnsupportedVideo]) -> bool:
     return all_valid
 
 
-if __name__ == "__main__":
-    # For testing, parse from file
-    filepath = "unsupportedvideos.txt"
-    print(f"Parsing from file: {filepath}")
-    page_token, videos = parse_from_file(filepath)
+def filter_real_videos(videos: List[UnsupportedVideo]) -> List[UnsupportedVideo]:
+    """Filter out VTT metadata files, keep only real video files."""
+    return [v for v in videos if not v.filename.endswith('_thumbs.vtt')]
 
-    if videos:
-        print(f"\nPage token: {page_token[:50] if page_token else 'None'}...")
-        print_video_info(videos, show_urls=False)
-        validate_videos(videos)
+
+def print_summary(videos: List[UnsupportedVideo]):
+    """Print a summary of all unsupported videos."""
+    real_videos = filter_real_videos(videos)
+    vtt_files = [v for v in videos if v.filename.endswith('_thumbs.vtt')]
+
+    print(f"\n{'='*70}")
+    print("UNSUPPORTED VIDEOS SUMMARY")
+    print(f"{'='*70}")
+    print(f"Total entries: {len(videos)}")
+    print(f"  - Real video files: {len(real_videos)}")
+    print(f"  - VTT thumbnail metadata: {len(vtt_files)}")
+
+    if real_videos:
+        total_size = sum(v.size_bytes for v in real_videos)
+        print(f"\nTotal size of real videos: {total_size / (1024**3):.2f} GB")
+
+        print(f"\n--- Real Video Files ({len(real_videos)}) ---")
+        for i, v in enumerate(real_videos, 1):
+            print(f"{i:3}. {v.filename}")
+            print(f"     Size: {v.size_human} | Date: {v.date.strftime('%Y-%m-%d %H:%M')}")
+            print(f"     ID: {v.media_id}")
+            print(f"     Download: {v.download_url[:80]}...")
+            print()
+
+    print(f"{'='*70}\n")
+
+
+if __name__ == "__main__":
+    if COOKIES:
+        # Fetch all pages from Google Photos
+        print("Fetching all unsupported videos from Google Photos...")
+        videos = fetch_all_unsupported_videos(COOKIES)
+
+        if videos:
+            print_summary(videos)
+            validate_videos(videos)
+        else:
+            print("No videos found!")
     else:
-        print("No videos found in response!")
+        # For testing without cookies, parse from file
+        filepath = "unsupportedvideos.txt"
+        print(f"No cookies set. Parsing from file: {filepath}")
+        page_token, videos = parse_from_file(filepath)
+
+        if videos:
+            print(f"\nPage token for next page: {page_token[:50] if page_token else 'None'}...")
+            print_summary(videos)
+            validate_videos(videos)
+        else:
+            print("No videos found in response!")
