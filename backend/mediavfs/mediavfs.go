@@ -1928,7 +1928,7 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 						if respErr == nil {
 							if headResp.StatusCode == http.StatusOK {
 								etag = headResp.Header.Get("ETag")
-								fs.Debugf(o, "Got ETag for unsupported video: %s", etag)
+								fs.Infof(o, "Got ETag for unsupported video: %s", etag)
 							}
 							headResp.Body.Close()
 						}
@@ -2192,9 +2192,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 	// Log response status to verify range request support
 	if res.StatusCode == http.StatusPartialContent {
-		fs.Debugf(o, "Download started (206 Partial Content): %s range %d-%d", o.remote, rangeStart, rangeEnd)
+		fs.Infof(o, "Download started (206 Partial Content): %s range %d-%d", o.remote, rangeStart, rangeEnd)
 	} else {
-		fs.Debugf(o, "Download started (200 OK - no range support): %s requested %d-%d but got full file", o.remote, rangeStart, rangeEnd)
+		fs.Infof(o, "Download started (200 OK - no range support): %s requested %d-%d but got full file", o.remote, rangeStart, rangeEnd)
 	}
 
 	return res.Body, nil
