@@ -878,52 +878,41 @@ type UnsupportedVideoItem struct {
 
 // WebSession holds web session cookies needed for batchexecute API
 type WebSession struct {
-	SAPISID   string
-	SID       string
-	HSID      string
-	SSID      string
-	OSID      string
-	PSID1     string // __Secure-1PSID
-	PSID3     string // __Secure-3PSID
-	APISID    string
-	PAPISID1  string // __Secure-1PAPISID
-	PAPISID3  string // __Secure-3PAPISID
+	// Raw cookie string containing all cookies
+	RawCookies string
+	// SAPISID extracted from cookies for SAPISIDHASH generation
+	SAPISID string
+	// SID extracted from cookies for validation
+	SID string
 }
 
-// CookieString builds the cookie header string for HTTP requests
+// NewWebSessionFromCookieString creates a WebSession from a raw cookie string
+func NewWebSessionFromCookieString(cookieStr string) *WebSession {
+	session := &WebSession{
+		RawCookies: cookieStr,
+	}
+
+	// Parse cookies to extract SAPISID and SID
+	for _, item := range strings.Split(cookieStr, ";") {
+		item = strings.TrimSpace(item)
+		if idx := strings.Index(item, "="); idx > 0 {
+			key := strings.TrimSpace(item[:idx])
+			value := strings.TrimSpace(item[idx+1:])
+			switch key {
+			case "SAPISID":
+				session.SAPISID = value
+			case "SID":
+				session.SID = value
+			}
+		}
+	}
+
+	return session
+}
+
+// CookieString returns the raw cookie string for HTTP requests
 func (s *WebSession) CookieString() string {
-	cookies := []string{}
-	if s.SAPISID != "" {
-		cookies = append(cookies, "SAPISID="+s.SAPISID)
-	}
-	if s.SID != "" {
-		cookies = append(cookies, "SID="+s.SID)
-	}
-	if s.HSID != "" {
-		cookies = append(cookies, "HSID="+s.HSID)
-	}
-	if s.SSID != "" {
-		cookies = append(cookies, "SSID="+s.SSID)
-	}
-	if s.OSID != "" {
-		cookies = append(cookies, "OSID="+s.OSID)
-	}
-	if s.PSID1 != "" {
-		cookies = append(cookies, "__Secure-1PSID="+s.PSID1)
-	}
-	if s.PSID3 != "" {
-		cookies = append(cookies, "__Secure-3PSID="+s.PSID3)
-	}
-	if s.APISID != "" {
-		cookies = append(cookies, "APISID="+s.APISID)
-	}
-	if s.PAPISID1 != "" {
-		cookies = append(cookies, "__Secure-1PAPISID="+s.PAPISID1)
-	}
-	if s.PAPISID3 != "" {
-		cookies = append(cookies, "__Secure-3PAPISID="+s.PAPISID3)
-	}
-	return strings.Join(cookies, "; ")
+	return s.RawCookies
 }
 
 // generateSAPISIDHash generates the SAPISIDHASH for web authentication

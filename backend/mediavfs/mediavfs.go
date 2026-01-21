@@ -229,44 +229,8 @@ func init() {
 			Default:  60,
 			Advanced: true,
 		}, {
-			Name:     "web_sapisid",
-			Help:     "SAPISID cookie for unsupported videos feature (optional).\n\nRequired along with web_sid to enable unsupported videos sync.\nGet from browser dev tools (photos.google.com cookies).\nUse cookie_parser.py to convert browser cookies to rclone config format.\nIf cookies expire, you will be notified to update them.",
-			Advanced: true,
-		}, {
-			Name:     "web_sid",
-			Help:     "SID cookie for unsupported videos feature (optional).\n\nRequired along with web_sapisid to enable unsupported videos sync.",
-			Advanced: true,
-		}, {
-			Name:     "web_hsid",
-			Help:     "HSID cookie for unsupported videos feature (optional).",
-			Advanced: true,
-		}, {
-			Name:     "web_ssid",
-			Help:     "SSID cookie for unsupported videos feature (optional).",
-			Advanced: true,
-		}, {
-			Name:     "web_osid",
-			Help:     "OSID cookie for unsupported videos feature (optional).",
-			Advanced: true,
-		}, {
-			Name:     "web_1psid",
-			Help:     "__Secure-1PSID cookie for unsupported videos feature (optional).",
-			Advanced: true,
-		}, {
-			Name:     "web_3psid",
-			Help:     "__Secure-3PSID cookie for unsupported videos feature (optional).",
-			Advanced: true,
-		}, {
-			Name:     "web_apisid",
-			Help:     "APISID cookie for unsupported videos feature (optional).",
-			Advanced: true,
-		}, {
-			Name:     "web_1papisid",
-			Help:     "__Secure-1PAPISID cookie for unsupported videos feature (optional).",
-			Advanced: true,
-		}, {
-			Name:     "web_3papisid",
-			Help:     "__Secure-3PAPISID cookie for unsupported videos feature (optional).",
+			Name:     "web_cookies",
+			Help:     "Raw cookie string for unsupported videos feature (optional).\n\nPaste the full cookie string from browser dev tools (photos.google.com).\nThis is the simplest way to configure cookies - just copy all cookies as a string.\nFormat: 'COOKIE1=value1; COOKIE2=value2; ...'",
 			Advanced: true,
 		}},
 	}
@@ -288,17 +252,8 @@ type Options struct {
 	AndroidID      string `config:"android_id"`
 	AutoSync       bool   `config:"auto_sync"`
 	SyncInterval   int    `config:"sync_interval"`
-	// Web session cookies for unsupported videos API
-	WebSAPISID  string `config:"web_sapisid"`
-	WebSID      string `config:"web_sid"`
-	WebHSID     string `config:"web_hsid"`
-	WebSSID     string `config:"web_ssid"`
-	WebOSID     string `config:"web_osid"`
-	Web1PSID    string `config:"web_1psid"`
-	Web3PSID    string `config:"web_3psid"`
-	WebAPISID   string `config:"web_apisid"`
-	Web1PAPISID string `config:"web_1papisid"`
-	Web3PAPISID string `config:"web_3papisid"`
+	// Web session cookies for unsupported videos API (raw cookie string)
+	WebCookies string `config:"web_cookies"`
 }
 
 // Fs represents a connection to the media database
@@ -2533,21 +2488,10 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) e
 
 // GetWebSession returns the web session from config if available
 func (f *Fs) GetWebSession() *gphoto.WebSession {
-	if f.opt.WebSAPISID == "" {
+	if f.opt.WebCookies == "" {
 		return nil
 	}
-	return &gphoto.WebSession{
-		SAPISID:  f.opt.WebSAPISID,
-		SID:      f.opt.WebSID,
-		HSID:     f.opt.WebHSID,
-		SSID:     f.opt.WebSSID,
-		OSID:     f.opt.WebOSID,
-		PSID1:    f.opt.Web1PSID,
-		PSID3:    f.opt.Web3PSID,
-		APISID:   f.opt.WebAPISID,
-		PAPISID1: f.opt.Web1PAPISID,
-		PAPISID3: f.opt.Web3PAPISID,
-	}
+	return gphoto.NewWebSessionFromCookieString(f.opt.WebCookies)
 }
 
 // SyncUnsupportedVideos fetches unsupported video download URLs and stores them in the database
