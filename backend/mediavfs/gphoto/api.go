@@ -1010,82 +1010,98 @@ func (api *API) GetUnsupportedVideos(ctx context.Context, session *WebSession, p
 }
 
 // parseBatchExecuteUnsupportedVideos parses the batchexecute response for unsupported videos
-// Response format: )]}'  followed by length and JSON data
+// Response format: )]}'  followed by length and JSON data lines
+// Matches the Python implementation logic for correct parsing
 func parseBatchExecuteUnsupportedVideos(body []byte) ([]UnsupportedVideoItem, string, error) {
 	bodyStr := string(body)
+	lines := strings.Split(bodyStr, "\n")
 
-	// Skip the garbage prefix )]}'
-	idx := strings.Index(bodyStr, "\n")
-	if idx == -1 {
-		return nil, "", fmt.Errorf("invalid batchexecute response format")
-	}
-	bodyStr = bodyStr[idx+1:]
-
-	// Skip the length line
-	idx = strings.Index(bodyStr, "\n")
-	if idx == -1 {
-		return nil, "", fmt.Errorf("invalid batchexecute response format: no length line")
-	}
-	bodyStr = bodyStr[idx+1:]
-
-	// Parse the JSON array
-	// Format: [["wrb.fr","TLvKMb","[nextPageToken,[[item1],[item2],...]]",null,null,null,"generic"]]
-	var outerArray []interface{}
-	if err := json.Unmarshal([]byte(bodyStr), &outerArray); err != nil {
-		return nil, "", fmt.Errorf("failed to parse outer JSON: %w", err)
-	}
-
-	if len(outerArray) == 0 {
-		return nil, "", nil
-	}
-
-	// Get the first element which is the response array
-	respArray, ok := outerArray[0].([]interface{})
-	if !ok || len(respArray) < 3 {
-		return nil, "", fmt.Errorf("invalid response array structure")
-	}
-
-	// Check RPC ID
-	rpcID, _ := respArray[1].(string)
-	if rpcID != "TLvKMb" {
-		return nil, "", fmt.Errorf("unexpected RPC ID: %s", rpcID)
-	}
-
-	// Parse the inner JSON data (index 2)
-	innerDataStr, ok := respArray[2].(string)
-	if !ok {
-		return nil, "", fmt.Errorf("inner data is not a string")
-	}
-
-	var innerData []interface{}
-	if err := json.Unmarshal([]byte(innerDataStr), &innerData); err != nil {
-		return nil, "", fmt.Errorf("failed to parse inner JSON: %w", err)
-	}
-
-	if len(innerData) < 2 {
-		return nil, "", nil
-	}
-
-	// Extract next page token (index 0)
-	var nextPageToken string
-	if token, ok := innerData[0].(string); ok {
-		nextPageToken = token
-	}
-
-	// Extract video items (index 1)
-	itemsArray, ok := innerData[1].([]interface{})
-	if !ok {
-		return nil, nextPageToken, nil
+	// Skip the )]}' prefix if present
+	startIdx := 0
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), ")]}'") {
+			startIdx = i + 1
+			break
+		}
 	}
 
 	var items []UnsupportedVideoItem
-	for _, itemData := range itemsArray {
-		item, err := parseUnsupportedVideoItem(itemData)
-		if err != nil {
-			fs.Debugf(nil, "gphoto: skipping unsupported video item: %v", err)
+	var nextPageToken string
+
+	// Find the TLvKMb response data line by line (matching Python logic)
+	for _, line := range lines[startIdx:] {
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
-		items = append(items, item)
+
+		// Skip content length lines (just numbers)
+		if _, err := strconv.Atoi(line); err == nil {
+			continue
+		}
+
+		// Look for the wrb.fr TLvKMb response
+		if !strings.Contains(line, `"wrb.fr","TLvKMb"`) {
+			continue
+		}
+
+		// Parse the outer array
+		var outer []interface{}
+		if err := json.Unmarshal([]byte(line), &outer); err != nil {
+			fs.Debugf(nil, "gphoto: failed to parse line as JSON: %v", err)
+			continue
+		}
+
+		// The structure is [[["wrb.fr","TLvKMb","<inner_json>",...],...]]
+		// Iterate over outer to find the TLvKMb item
+		for _, item := range outer {
+			itemArr, ok := item.([]interface{})
+			if !ok || len(itemArr) < 3 {
+				continue
+			}
+
+			// Check if this is the TLvKMb response
+			if itemArr[0] != "wrb.fr" || itemArr[1] != "TLvKMb" {
+				continue
+			}
+
+			// item[2] is a JSON string containing the actual data
+			innerJSON, ok := itemArr[2].(string)
+			if !ok || innerJSON == "" {
+				continue
+			}
+
+			// Parse inner JSON
+			var innerData []interface{}
+			if err := json.Unmarshal([]byte(innerJSON), &innerData); err != nil {
+				fs.Debugf(nil, "gphoto: failed to parse inner JSON: %v", err)
+				continue
+			}
+
+			// innerData[0] is the page token
+			if len(innerData) > 0 && innerData[0] != nil {
+				if token, ok := innerData[0].(string); ok {
+					nextPageToken = token
+				}
+			}
+
+			// innerData[1] is the list of video entries
+			if len(innerData) > 1 && innerData[1] != nil {
+				entries, ok := innerData[1].([]interface{})
+				if !ok {
+					continue
+				}
+
+				for _, entry := range entries {
+					item, err := parseUnsupportedVideoItem(entry)
+					if err != nil {
+						fs.Debugf(nil, "gphoto: skipping unsupported video item: %v", err)
+						continue
+					}
+					items = append(items, item)
+				}
+			}
+		}
 	}
 
 	return items, nextPageToken, nil
