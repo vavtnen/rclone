@@ -26,6 +26,12 @@ import (
 // ErrMediaNotFound is returned when a media item doesn't exist (404)
 var ErrMediaNotFound = errors.New("media item not found")
 
+// ErrCookiesExpired is returned when web session cookies have expired
+var ErrCookiesExpired = errors.New("web session cookies have expired - please provide new cookies")
+
+// ErrCookiesMissing is returned when required cookies are not configured
+var ErrCookiesMissing = errors.New("web cookies not configured - set web_sapisid and web_sid to use unsupported videos feature")
+
 // Request counter for debugging rate limits
 var apiRequestCount int64
 var apiRequestMu sync.Mutex
@@ -33,6 +39,8 @@ var apiRequestMu sync.Mutex
 const (
 	defaultTimeout = 60 * time.Second
 	maxRetries     = 10
+	// WebUserAgent is the User-Agent string used for all web session HTTP requests
+	WebUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 )
 
 // backoffWithJitter returns an exponential backoff duration with jitter.
@@ -929,9 +937,10 @@ func generateSAPISIDHash(sapisid, origin string) string {
 
 // GetUnsupportedVideos fetches the list of unsupported videos using the batchexecute API
 // This requires web session cookies (SAPISID, SID) which can be obtained from a browser session
+// Returns ErrCookiesMissing if cookies are not configured, ErrCookiesExpired if cookies have expired
 func (api *API) GetUnsupportedVideos(ctx context.Context, session *WebSession, pageToken string) ([]UnsupportedVideoItem, string, error) {
-	if session == nil || session.SAPISID == "" {
-		return nil, "", fmt.Errorf("web session required for unsupported videos API")
+	if session == nil || session.SAPISID == "" || session.SID == "" {
+		return nil, "", ErrCookiesMissing
 	}
 
 	origin := "https://photos.google.com"
@@ -964,7 +973,7 @@ func (api *API) GetUnsupportedVideos(ctx context.Context, session *WebSession, p
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", "https://photos.google.com/unsupportedvideos")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", WebUserAgent)
 	req.Header.Set("X-Same-Domain", "1")
 	req.Header.Set("Authorization", "SAPISIDHASH "+sapisidhash)
 
@@ -977,9 +986,19 @@ func (api *API) GetUnsupportedVideos(ctx context.Context, session *WebSession, p
 	}
 	defer resp.Body.Close()
 
+	// Check for authentication errors indicating expired cookies
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, "", ErrCookiesExpired
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, "", fmt.Errorf("batchexecute failed with status %d: %s", resp.StatusCode, string(body[:min(len(body), 500)]))
+		bodyStr := string(body[:min(len(body), 500)])
+		// Check for login page redirect in response body
+		if strings.Contains(bodyStr, "accounts.google.com") || strings.Contains(bodyStr, "ServiceLogin") {
+			return nil, "", ErrCookiesExpired
+		}
+		return nil, "", fmt.Errorf("batchexecute failed with status %d: %s", resp.StatusCode, bodyStr)
 	}
 
 	body, err := io.ReadAll(resp.Body)

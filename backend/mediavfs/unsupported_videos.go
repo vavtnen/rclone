@@ -3,6 +3,7 @@ package mediavfs
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -137,11 +138,19 @@ func (f *Fs) UpsertUnsupportedVideos(ctx context.Context, videos []gphoto.Unsupp
 
 // SyncUnsupportedVideosNew syncs unsupported videos from Google Photos to the database
 // This creates new entries for videos that aren't in the regular library
+// Returns nil if web cookies are not configured (feature is optional)
+// Returns error with user notification if cookies are expired
 func (f *Fs) SyncUnsupportedVideosNew(ctx context.Context) error {
-	// Check if web cookies are configured
+	// Check if web cookies are configured - this feature is optional
 	session := f.GetWebSession()
 	if session == nil {
-		fs.Debugf(f, "Web cookies not configured, skipping unsupported videos sync")
+		fs.Debugf(f, "Web cookies not configured, skipping unsupported videos sync (optional feature)")
+		return nil
+	}
+
+	// Validate minimum required cookies
+	if session.SAPISID == "" || session.SID == "" {
+		fs.Debugf(f, "Required web cookies (web_sapisid, web_sid) not configured, skipping unsupported videos sync")
 		return nil
 	}
 
@@ -158,6 +167,15 @@ func (f *Fs) SyncUnsupportedVideosNew(ctx context.Context) error {
 
 		items, nextPageToken, err := f.api.GetUnsupportedVideos(ctx, session, pageToken)
 		if err != nil {
+			// Check for specific error types and notify user appropriately
+			if errors.Is(err, gphoto.ErrCookiesExpired) {
+				fs.Errorf(f, "Web session cookies have expired. Please update your cookies in rclone config (web_sapisid, web_sid, etc.) to continue syncing unsupported videos.")
+				return fmt.Errorf("cookies expired: %w", err)
+			}
+			if errors.Is(err, gphoto.ErrCookiesMissing) {
+				fs.Infof(f, "Web cookies not fully configured. To sync unsupported videos, set web_sapisid and web_sid in rclone config.")
+				return nil // Not an error, just skip this optional feature
+			}
 			return fmt.Errorf("failed to fetch page %d: %w", pageNum, err)
 		}
 

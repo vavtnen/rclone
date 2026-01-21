@@ -230,43 +230,43 @@ func init() {
 			Advanced: true,
 		}, {
 			Name:     "web_sapisid",
-			Help:     "SAPISID cookie from browser session for unsupported videos API.\n\nRequired for downloading unsupported videos. Get from browser dev tools.\nUse cookie_parser.py to convert browser cookies to rclone config format.",
+			Help:     "SAPISID cookie for unsupported videos feature (optional).\n\nRequired along with web_sid to enable unsupported videos sync.\nGet from browser dev tools (photos.google.com cookies).\nUse cookie_parser.py to convert browser cookies to rclone config format.\nIf cookies expire, you will be notified to update them.",
 			Advanced: true,
 		}, {
 			Name:     "web_sid",
-			Help:     "SID cookie from browser session for unsupported videos API.",
+			Help:     "SID cookie for unsupported videos feature (optional).\n\nRequired along with web_sapisid to enable unsupported videos sync.",
 			Advanced: true,
 		}, {
 			Name:     "web_hsid",
-			Help:     "HSID cookie from browser session for unsupported videos API.",
+			Help:     "HSID cookie for unsupported videos feature (optional).",
 			Advanced: true,
 		}, {
 			Name:     "web_ssid",
-			Help:     "SSID cookie from browser session for unsupported videos API.",
+			Help:     "SSID cookie for unsupported videos feature (optional).",
 			Advanced: true,
 		}, {
 			Name:     "web_osid",
-			Help:     "OSID cookie from browser session for unsupported videos API.",
+			Help:     "OSID cookie for unsupported videos feature (optional).",
 			Advanced: true,
 		}, {
 			Name:     "web_1psid",
-			Help:     "__Secure-1PSID cookie from browser session for unsupported videos API.",
+			Help:     "__Secure-1PSID cookie for unsupported videos feature (optional).",
 			Advanced: true,
 		}, {
 			Name:     "web_3psid",
-			Help:     "__Secure-3PSID cookie from browser session for unsupported videos API.",
+			Help:     "__Secure-3PSID cookie for unsupported videos feature (optional).",
 			Advanced: true,
 		}, {
 			Name:     "web_apisid",
-			Help:     "APISID cookie from browser session for unsupported videos API.",
+			Help:     "APISID cookie for unsupported videos feature (optional).",
 			Advanced: true,
 		}, {
 			Name:     "web_1papisid",
-			Help:     "__Secure-1PAPISID cookie from browser session for unsupported videos API.",
+			Help:     "__Secure-1PAPISID cookie for unsupported videos feature (optional).",
 			Advanced: true,
 		}, {
 			Name:     "web_3papisid",
-			Help:     "__Secure-3PAPISID cookie from browser session for unsupported videos API.",
+			Help:     "__Secure-3PAPISID cookie for unsupported videos feature (optional).",
 			Advanced: true,
 		}},
 	}
