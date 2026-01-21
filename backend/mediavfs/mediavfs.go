@@ -1918,86 +1918,25 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 				}
 				if unsupportedURL != "" {
 					fs.Infof(o, "Using unsupported video download URL for %s", o.remote)
-
-					// Do a HEAD request to resolve URL (follow redirects) and get ETag
-					// This matches the normal file HEAD request flow
-					var resolvedURL string = unsupportedURL
-					var etag string
-					var fileSize int64 = o.size
-
-					for attempt := 0; attempt < 3; attempt++ {
-						if attempt > 0 {
-							sleepTime := time.Duration(1<<uint(attempt-1)) * time.Second
-							fs.Debugf(o, "Retrying HEAD for unsupported video %s after %v (attempt %d/3)", o.remote, sleepTime, attempt+1)
-							time.Sleep(sleepTime)
-						}
-
-						headReq, headErr := http.NewRequestWithContext(ctx, "HEAD", unsupportedURL, nil)
-						if headErr != nil {
-							fs.Debugf(o, "Failed to create HEAD request for unsupported video: %v", headErr)
-							break
-						}
-						headReq.Header.Set("User-Agent", gphoto.WebUserAgent)
-
-						headResp, respErr := o.fs.httpClient.Do(headReq)
-						if respErr != nil {
-							fs.Debugf(o, "HEAD request failed for unsupported video: %v", respErr)
-							continue
-						}
-
-						if headResp.StatusCode == http.StatusOK {
-							// Get the resolved URL after any redirects
-							resolvedURL = headResp.Request.URL.String()
-							etag = headResp.Header.Get("ETag")
-							if contentLength := headResp.Header.Get("Content-Length"); contentLength != "" {
-								fmt.Sscanf(contentLength, "%d", &fileSize)
-							}
-							fs.Infof(o, "Resolved unsupported video URL, ETag: %s, Size: %d", etag, fileSize)
-							headResp.Body.Close()
-							break
-						} else if headResp.StatusCode == http.StatusTooManyRequests {
-							retryAfter := headResp.Header.Get("Retry-After")
-							waitTime := time.Duration(1<<uint(attempt)) * time.Second
-							if retryAfter != "" {
-								if seconds, parseErr := strconv.Atoi(retryAfter); parseErr == nil {
-									waitTime = time.Duration(seconds) * time.Second
-								}
-							}
-							fs.Infof(o, "Rate limited (429) for unsupported video %s, waiting %v", o.remote, waitTime)
-							headResp.Body.Close()
-							time.Sleep(waitTime)
-							continue
-						} else {
-							fs.Debugf(o, "HEAD request for unsupported video returned %d", headResp.StatusCode)
-							headResp.Body.Close()
-							break
-						}
-					}
-
-					meta := &urlMetadata{
-						resolvedURL: resolvedURL,
-						etag:        etag,
-						size:        fileSize,
-						expiresAt:   time.Now().Add(50 * time.Minute), // Shorter TTL for unsupported videos
-						lastAccess:  time.Now(),
-					}
-					o.fs.urlCache.set(cacheKey, meta)
-					return meta, nil
-				}
-
-				fs.Errorf(o, "File not found in Google Photos: %s - marking as missing (trash_timestamp=-2)", o.remote)
-				// Set trash_timestamp = -2, path = '', name = file_name to mark as missing/404
-				updateQuery := fmt.Sprintf(`UPDATE %s SET trash_timestamp = -2, path = '', name = file_name WHERE media_key = $1`, o.fs.opt.TableName)
-				_, updateErr := o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
-				if updateErr != nil {
-					fs.Errorf(o, "Failed to mark missing media in database: %v", updateErr)
+					initialURL = unsupportedURL
+					err = nil // Clear the error, continue with normal flow
 				} else {
-					o.fs.removeFromDirCache(o.displayPath, o.displayName)
+					fs.Errorf(o, "File not found in Google Photos: %s - marking as missing (trash_timestamp=-2)", o.remote)
+					// Set trash_timestamp = -2, path = '', name = file_name to mark as missing/404
+					updateQuery := fmt.Sprintf(`UPDATE %s SET trash_timestamp = -2, path = '', name = file_name WHERE media_key = $1`, o.fs.opt.TableName)
+					_, updateErr := o.fs.db.ExecContext(ctx, updateQuery, o.mediaKey)
+					if updateErr != nil {
+						fs.Errorf(o, "Failed to mark missing media in database: %v", updateErr)
+					} else {
+						o.fs.removeFromDirCache(o.displayPath, o.displayName)
+					}
+					return nil, fs.ErrorObjectNotFound
 				}
-				return nil, fs.ErrorObjectNotFound
 			}
-			fs.Errorf(o, "Failed to get download URL for %s: %v", o.remote, err)
-			return nil, fmt.Errorf("failed to get download URL for %s: %w", o.remote, err)
+			if err != nil {
+				fs.Errorf(o, "Failed to get download URL for %s: %v", o.remote, err)
+				return nil, fmt.Errorf("failed to get download URL for %s: %w", o.remote, err)
+			}
 		}
 
 		// Resolve URL and get ETag via HEAD request
@@ -2156,13 +2095,8 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			return nil, fmt.Errorf("failed to create request for %s: %w", o.remote, err)
 		}
 
-		// Set User-Agent header - use browser User-Agent for unsupported video URLs
-		// as they require browser authentication context for proper streaming support
-		if strings.Contains(resolvedURL, "video-downloads.googleusercontent.com") {
-			req.Header.Set("User-Agent", gphoto.WebUserAgent)
-		} else {
-			req.Header.Set("User-Agent", "AndroidDownloadManager/13")
-		}
+		// Set User-Agent header
+		req.Header.Set("User-Agent", "AndroidDownloadManager/13")
 
 		// Add If-Range header with ETag if we have it
 		if etag != "" {
