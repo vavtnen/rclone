@@ -2022,7 +2022,7 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 			fileSize = o.size
 		}
 
-		fs.Infof(o, "HEAD response: URL=%s ETag=%q Accept-Ranges=%s Content-Length=%d", resolvedURL, etag, acceptRanges, fileSize)
+		fs.Infof(nil, "HEAD %s ETag=%q Accept-Ranges=%s Content-Length=%d", o.remote, etag, acceptRanges, fileSize)
 
 		// Cache the metadata
 		meta := &urlMetadata{
@@ -2074,7 +2074,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 
 	// Log download with range info
-	fs.Infof(o, "Downloading %s %s %d-%d", o.remote, o.mediaKey, rangeStart, rangeEnd)
+	fs.Infof(nil, "Downloading %s %s %d-%d", o.remote, o.mediaKey, rangeStart, rangeEnd)
 
 	// Now make the actual GET request to the resolved URL with retry logic
 	var res *http.Response
@@ -2112,7 +2112,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 		}
 
 		// Log request details for debugging range request issues
-		fs.Infof(o, "GET request: URL=%s ETag=%q Range=%s", resolvedURL, etag, req.Header.Get("Range"))
+		fs.Infof(nil, "GET %s ETag=%q Range=%s", o.remote, etag, req.Header.Get("Range"))
 
 		// Execute the request
 		res, getErr = o.fs.httpClient.Do(req)
@@ -2175,9 +2175,9 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	contentRange := res.Header.Get("Content-Range")
 	contentLength := res.Header.Get("Content-Length")
 	if res.StatusCode == http.StatusPartialContent {
-		fs.Infof(o, "Download started (206 Partial Content): %s range %d-%d, Content-Range: %s", o.remote, rangeStart, rangeEnd, contentRange)
+		fs.Infof(nil, "206 %s %d-%d Content-Range: %s", o.remote, rangeStart, rangeEnd, contentRange)
 	} else {
-		fs.Infof(o, "Download started (200 OK - no range support): %s requested %d-%d, Accept-Ranges: %s, Content-Length: %s", o.remote, rangeStart, rangeEnd, acceptRanges, contentLength)
+		fs.Infof(nil, "200 %s %d-%d Accept-Ranges: %s Content-Length: %s", o.remote, rangeStart, rangeEnd, acceptRanges, contentLength)
 	}
 
 	return res.Body, nil
