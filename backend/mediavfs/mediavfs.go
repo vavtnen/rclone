@@ -1932,7 +1932,9 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 						o.fs.removeFromDirCache(o.displayPath, o.displayName)
 						o.fs.objectCache.Delete(o.remote)
 					}
-					return nil, fs.ErrorObjectNotFound
+					// Return a generic error that translates to EIO instead of ENOENT.
+					// Apps handle EIO better when file appeared to exist but can't be read.
+					return nil, errors.New("file no longer available on Google Photos server")
 				}
 			}
 			if err != nil {
@@ -2000,7 +2002,9 @@ func (o *Object) fetchURLMetadata(ctx context.Context) (*urlMetadata, error) {
 						o.fs.removeFromDirCache(o.displayPath, o.displayName)
 						o.fs.objectCache.Delete(o.remote)
 					}
-					return nil, fs.ErrorObjectNotFound
+					// Return a generic error that translates to EIO instead of ENOENT.
+					// Apps handle EIO better when file appeared to exist but can't be read.
+					return nil, errors.New("file no longer available on Google Photos server")
 				}
 				// Other permanent errors - don't retry
 				fs.Errorf(o, "HEAD request failed for %s: HTTP %d %s", o.remote, headResp.StatusCode, headResp.Status)
